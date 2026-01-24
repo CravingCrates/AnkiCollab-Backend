@@ -62,6 +62,7 @@ pub struct Notetype {
 /* Notes */
 #[derive(Deserialize, Serialize)]
 pub struct Note {
+    pub id: i64,
     pub fields: Vec<String>,
     pub guid: String,
     pub note_model_uuid: String, // this string equals Notetype::crowdanki_uuid
@@ -107,7 +108,7 @@ pub struct NoteModelFieldInfo {
 #[derive(Serialize, Deserialize)]
 pub struct NoteModel {
     pub id: i64,
-    pub fields:Vec<NoteModelFieldInfo>,
+    pub fields: Vec<NoteModelFieldInfo>,
     pub name: String,
 }
 
@@ -122,7 +123,6 @@ pub struct UpdateInfoResponse {
     pub stats_enabled: bool,
 }
 
-
 #[derive(Deserialize, Serialize)]
 pub struct CreateDeckReq {
     pub deck: String,
@@ -132,10 +132,10 @@ pub struct CreateDeckReq {
 #[derive(Deserialize, Serialize)]
 pub struct SubmitCardReq {
     pub remote_deck: String, // Hash of the deck
-    pub deck_path: String, // Path to the deck in Anki Format
+    pub deck_path: String,   // Path to the deck in Anki Format
     pub new_name: String, // Users can rename the top most deck. This helps us to keep track of the original name
-    pub deck: String, // JSON String of the actual deck content
-    pub rationale: i32, // Enum. See elsewhere
+    pub deck: String,     // JSON String of the actual deck content
+    pub rationale: i32,   // Enum. See elsewhere
     pub commit_text: String, // (optional) additional info
     pub token: String,
     pub force_overwrite: bool,
@@ -191,7 +191,7 @@ pub struct TokenInfo {
     pub deck_hash: String,
 }
 
-// Media management 
+// Media management
 
 #[derive(Debug, Serialize)]
 pub struct MediaDownloadItem {
@@ -213,13 +213,14 @@ pub struct MediaManifestResponse {
     pub expires_at: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct MediaMissingFile {
     pub hash: String,
     pub note_id: i64,
     pub filename: String,
     pub file_size: i64,
-    pub presigned_url: Option<String>,
+    #[serde(alias = "presigned_url")]
+    pub upload_url: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -234,6 +235,7 @@ pub struct MediaBulkCheckResponse {
 pub struct MediaBulkConfirmRequest {
     pub batch_id: String,
     pub confirmed_files: Vec<String>, // List of file hashes that were uploaded
+    pub bulk_operation_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -254,6 +256,7 @@ pub struct MediaBulkCheckRequest {
     pub token: String,
     pub deck_hash: String,
     pub files: Vec<MediaFileInfo>,
+    pub bulk_operation_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -279,7 +282,7 @@ pub struct SvgFileItem {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SvgSanitizeRequest {
-    pub svg_files: Vec<SvgFileItem>
+    pub svg_files: Vec<SvgFileItem>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -291,5 +294,26 @@ pub struct SanitizedSvgItem {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SvgSanitizeResponse {
-    pub sanitized_files: Vec<SanitizedSvgItem>
+    pub sanitized_files: Vec<SanitizedSvgItem>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateDeckLinkRequest {
+    pub subscriber_deck_hash: String,
+    pub base_deck_hash: String,
+    pub token: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateNewNoteLinkRequest {
+    pub subscriber_deck_hash: String,
+    pub base_deck_hash: String,
+    pub note_guids: Vec<String>,
+    pub token: String,
+}
+
+#[derive(Deserialize)]
+pub struct LatestPointer {
+    pub version_ts: String,
+    pub manifest_key: String,
 }

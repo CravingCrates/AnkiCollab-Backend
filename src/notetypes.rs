@@ -1,7 +1,10 @@
-
-
-
-use crate::{cleanser, database, structs::{CardRequirement, Note, NoteModel, NoteModelFieldInfo, Notetype, NotetypeField, NotetypeTemplate}};
+use crate::{
+    cleanser, database,
+    structs::{
+        CardRequirement, Note, NoteModel, NoteModelFieldInfo, Notetype, NotetypeField,
+        NotetypeTemplate,
+    },
+};
 use std::collections::HashSet;
 
 use database::SharedConn;
@@ -12,8 +15,9 @@ pub async fn get_notetype_fields(client: &SharedConn, notetype_id: i64) -> Vec<N
                 .await.expect("Error preparing statement");
 
     let rows = client
-                .query(&stmt, &[&notetype_id])
-                .await.expect("Error executing statement");
+        .query(&stmt, &[&notetype_id])
+        .await
+        .expect("Error executing statement");
 
     let mut fields = Vec::with_capacity(rows.len());
 
@@ -28,16 +32,31 @@ pub async fn get_notetype_fields(client: &SharedConn, notetype_id: i64) -> Vec<N
         let id: Option<i64> = row.get(7);
         let tag: Option<i32> = row.get(8);
 
-        fields.push(NotetypeField { description, font, id, name, ord, rtl, size, sticky, tag });
+        fields.push(NotetypeField {
+            description,
+            font,
+            id,
+            name,
+            ord,
+            rtl,
+            size,
+            sticky,
+            tag,
+        });
     }
     fields
 }
 
-pub async fn get_notetype_templates(client: &SharedConn, notetype_id: i64) -> Vec<NotetypeTemplate> {
+pub async fn get_notetype_templates(
+    client: &SharedConn,
+    notetype_id: i64,
+) -> Vec<NotetypeTemplate> {
     let stmt = client.prepare("SELECT qfmt, afmt, bqfmt, bafmt, bfont, bsize, name, anki_id, ord FROM notetype_template WHERE notetype = $1 ORDER BY position").await
                      .expect("Error preparing statement");
-    let rows = client.query(&stmt, &[&notetype_id]).await
-                     .expect("Error executing statement");
+    let rows = client
+        .query(&stmt, &[&notetype_id])
+        .await
+        .expect("Error executing statement");
 
     let mut templates = Vec::with_capacity(rows.len());
 
@@ -52,7 +71,17 @@ pub async fn get_notetype_templates(client: &SharedConn, notetype_id: i64) -> Ve
         let id: Option<i64> = row.get(7);
         let ord: i32 = row.get(8);
 
-        templates.push(NotetypeTemplate { afmt, bafmt, bfont, bqfmt, bsize, id, name, ord, qfmt });
+        templates.push(NotetypeTemplate {
+            afmt,
+            bafmt,
+            bfont,
+            bqfmt,
+            bsize,
+            id,
+            name,
+            ord,
+            qfmt,
+        });
     }
     templates
 }
@@ -66,7 +95,10 @@ pub async fn get_notetypes(client: &SharedConn, notes: &Vec<Note>, owner: i32) -
         notetype_guids.insert(note.note_model_uuid.clone());
     }
 
-    let notetype_guids_vec: Vec<&str> = notetype_guids.iter().map(std::string::String::as_str).collect();
+    let notetype_guids_vec: Vec<&str> = notetype_guids
+        .iter()
+        .map(std::string::String::as_str)
+        .collect();
 
     let stmt = client
         .prepare("
@@ -123,7 +155,10 @@ pub async fn get_notetypes(client: &SharedConn, notes: &Vec<Note>, owner: i32) -
     notetypes
 }
 
-pub async fn pull_protected_fields(client: &SharedConn, human_hash: &String) -> std::result::Result<Vec<NoteModel>, Box<dyn std::error::Error>> {
+pub async fn pull_protected_fields(
+    client: &SharedConn,
+    human_hash: &String,
+) -> std::result::Result<Vec<NoteModel>, Box<dyn std::error::Error + Send + Sync>> {
     let query = "
     WITH RECURSIVE subdecks AS (
         SELECT id, human_hash
@@ -166,7 +201,7 @@ pub async fn pull_protected_fields(client: &SharedConn, human_hash: &String) -> 
                 fields: Vec::new(),
                 name: notetype_name.clone(),
             };
-        } 
+        }
         current_note_model.fields.push(NoteModelFieldInfo {
             id: notetype_field_id,
             name: notetype_field_name,
@@ -179,55 +214,84 @@ pub async fn pull_protected_fields(client: &SharedConn, human_hash: &String) -> 
     Ok(note_models)
 }
 
-pub async fn does_notetype_exist(client: &SharedConn, notetype: &Notetype, owner: i32) -> std::result::Result<String, Box<dyn std::error::Error>> {
-    let check_existing_notetype = client.query("SELECT id from notetype where guid = $1 AND owner = $2", &[&notetype.crowdanki_uuid, &owner]).await?;
-    
+pub async fn does_notetype_exist(
+    client: &SharedConn,
+    notetype: &Notetype,
+    owner: i32,
+) -> std::result::Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let check_existing_notetype = client
+        .query(
+            "SELECT id from notetype where guid = $1 AND owner = $2",
+            &[&notetype.crowdanki_uuid, &owner],
+        )
+        .await?;
+
     if !check_existing_notetype.is_empty() {
         return Ok(notetype.crowdanki_uuid.clone());
     }
 
-    // Before inserting a new notetype, I would like to check if a notetype that is semantically equal, already exists. So query all notetypes that are owned by owner 
-    // and then check if the notetype.fields and notetype.templates (as well as basic metrics) match a notetype that already exists. If so, return the id of that notetype. 
+    // Before inserting a new notetype, I would like to check if a notetype that is semantically equal, already exists. So query all notetypes that are owned by owner
+    // and then check if the notetype.fields and notetype.templates (as well as basic metrics) match a notetype that already exists. If so, return the id of that notetype.
 
-    let existing_notetype_fields_stmt = client.prepare("SELECT name, anki_id FROM notetype_field where notetype = $1 ORDER BY position").await?;
-    
+    let existing_notetype_fields_stmt = client
+        .prepare("SELECT name, anki_id FROM notetype_field where notetype = $1 ORDER BY position")
+        .await?;
+
     let existing_notetype_templates_stmt = client.prepare("SELECT qfmt, afmt, bqfmt, bafmt, anki_id, name FROM notetype_template where notetype = $1 ORDER BY position").await?;
 
     let req_json = serde_json::to_string(&notetype.req)?;
     let check_existing_notetype = client.query("SELECT id, guid, original_stock_kind from notetype where owner = $1 and type = $2 and req = $3", &[&owner, &notetype.type_, &req_json]).await?;
 
     for row in check_existing_notetype {
-        if !notetype.original_stock_kind.zip(row.get::<_, Option<i32>>(2)).map_or(true, |(a, b)| a == b){
+        if !notetype
+            .original_stock_kind
+            .zip(row.get::<_, Option<i32>>(2))
+            .map_or(true, |(a, b)| a == b)
+        {
             continue;
         }
 
         let existing_notetype_id: i64 = row.get(0);
         let existing_notetype_guid: String = row.get(1);
 
-        let existing_notetype_fields = client.query(&existing_notetype_fields_stmt, &[&existing_notetype_id]).await?;
-        let existing_notetype_templates = client.query(&existing_notetype_templates_stmt, &[&existing_notetype_id]).await?;
+        let existing_notetype_fields = client
+            .query(&existing_notetype_fields_stmt, &[&existing_notetype_id])
+            .await?;
+        let existing_notetype_templates = client
+            .query(&existing_notetype_templates_stmt, &[&existing_notetype_id])
+            .await?;
 
-        if notetype.flds.len() != existing_notetype_fields.len() || notetype.tmpls.len() != existing_notetype_templates.len() {
+        if notetype.flds.len() != existing_notetype_fields.len()
+            || notetype.tmpls.len() != existing_notetype_templates.len()
+        {
             continue;
         }
-        
+
         let matching_fields = notetype.flds.iter().enumerate().all(|(i, field)| {
             existing_notetype_fields.get(i).map_or(false, |existing| {
-                let id_match = field.id.zip(existing.get::<_, Option<i64>>(1)).map_or(true, |(a, b)| a == b);
+                let id_match = field
+                    .id
+                    .zip(existing.get::<_, Option<i64>>(1))
+                    .map_or(true, |(a, b)| a == b);
                 let name_match = field.name == existing.get::<_, String>(0);
                 id_match || name_match
             })
         });
-        
+
         let matching_templates = notetype.tmpls.iter().enumerate().all(|(i, template)| {
-            existing_notetype_templates.get(i).map_or(false, |existing| {
-                let id_match = template.id.zip(existing.get::<_, Option<i64>>(4)).map_or(true, |(a, b)| a == b);
-                let qfmt_match = template.qfmt == existing.get::<_, String>(0);
-                let afmt_match = template.afmt == existing.get::<_, String>(1);
-                let bqfmt_match = template.bqfmt == existing.get::<_, String>(2);
-                let bafmt_match = template.bafmt == existing.get::<_, String>(3);
-                id_match || (qfmt_match && afmt_match && bqfmt_match && bafmt_match)
-            })
+            existing_notetype_templates
+                .get(i)
+                .map_or(false, |existing| {
+                    let id_match = template
+                        .id
+                        .zip(existing.get::<_, Option<i64>>(4))
+                        .map_or(true, |(a, b)| a == b);
+                    let qfmt_match = template.qfmt == existing.get::<_, String>(0);
+                    let afmt_match = template.afmt == existing.get::<_, String>(1);
+                    let bqfmt_match = template.bqfmt == existing.get::<_, String>(2);
+                    let bafmt_match = template.bafmt == existing.get::<_, String>(3);
+                    id_match || (qfmt_match && afmt_match && bqfmt_match && bafmt_match)
+                })
         });
 
         // Try to find a notetype that is exactly the same, (Best case)
@@ -236,14 +300,19 @@ pub async fn does_notetype_exist(client: &SharedConn, notetype: &Notetype, owner
         }
 
         let dirty_matching_templates = notetype.tmpls.iter().enumerate().all(|(i, template)| {
-            existing_notetype_templates.get(i).map_or(false, |existing| {
-                let id_match = template.id.zip(existing.get::<_, Option<i64>>(4)).map_or(true, |(a, b)| a == b);
-                let name_match = template.name == existing.get::<_, String>(5);
-                id_match || name_match
-            })
+            existing_notetype_templates
+                .get(i)
+                .map_or(false, |existing| {
+                    let id_match = template
+                        .id
+                        .zip(existing.get::<_, Option<i64>>(4))
+                        .map_or(true, |(a, b)| a == b);
+                    let name_match = template.name == existing.get::<_, String>(5);
+                    id_match || name_match
+                })
         });
         // If not, try to find a notetype that has the same fields and similar templates (Second best case)
-        if matching_fields && dirty_matching_templates {            
+        if matching_fields && dirty_matching_templates {
             return Ok(existing_notetype_guid);
         }
     }
@@ -251,13 +320,18 @@ pub async fn does_notetype_exist(client: &SharedConn, notetype: &Notetype, owner
     Ok(String::new())
 }
 
-
-pub async fn unpack_notetype(client: &mut SharedConn, notetype: &Notetype, deck: Option<i64>) -> std::result::Result<String, Box<dyn std::error::Error>> {
+pub async fn unpack_notetype(
+    client: &mut SharedConn,
+    notetype: &Notetype,
+    deck: Option<i64>,
+) -> std::result::Result<String, Box<dyn std::error::Error + Send + Sync>> {
     if deck.is_none() {
         return Err("Attempted insertion on no deck. Abort.".into());
     }
-    
-    let deck_owner = client.query("SELECT owner from decks where id = $1", &[&deck]).await?;
+
+    let deck_owner = client
+        .query("SELECT owner from decks where id = $1", &[&deck])
+        .await?;
     if deck_owner.is_empty() {
         return Err("Deck does not exist".into());
     }
@@ -293,61 +367,83 @@ pub async fn unpack_notetype(client: &mut SharedConn, notetype: &Notetype, deck:
     let cleaned_notetype_name = cleanser::clean(&notetype.name);
 
     let req_json = serde_json::to_string(&notetype.req)?;
-    let rows = tx.query(&insert_notetype_stmt, &[
-        &notetype.crowdanki_uuid,
-        &owner,
-        &notetype.css,
-        &notetype.latex_post,
-        &notetype.latex_pre,
-        &notetype.latex_svg,
-        &cleaned_notetype_name,
-        &notetype.type_,
-        &original_stock_kind,
-        &notetype.sortf,
-        &req_json,
-    ]).await?;
-    
-    
-    let id:i64 = rows[0].get(0);
+    let rows = tx
+        .query(
+            &insert_notetype_stmt,
+            &[
+                &notetype.crowdanki_uuid,
+                &owner,
+                &notetype.css,
+                &notetype.latex_post,
+                &notetype.latex_pre,
+                &notetype.latex_svg,
+                &cleaned_notetype_name,
+                &notetype.type_,
+                &original_stock_kind,
+                &notetype.sortf,
+                &req_json,
+            ],
+        )
+        .await?;
 
-    for (i, field) in notetype.flds.iter().enumerate().map(|(i, field)| (i as u32, field)) {
+    let id: i64 = rows[0].get(0);
+
+    for (i, field) in notetype
+        .flds
+        .iter()
+        .enumerate()
+        .map(|(i, field)| (i as u32, field))
+    {
         let anki_id = field.id.unwrap_or(0);
         let tag = field.tag.unwrap_or(0);
         let cleaned_field_description = ammonia::clean(&field.description);
         let cleaned_field_name = cleanser::clean(&field.name);
 
-        tx.execute(&insert_notetype_field_stmt, &[
-            &id,
-            &cleaned_field_description,
-            &field.font,
-            &cleaned_field_name,
-            &field.ord,
-            &field.rtl,
-            &field.size,
-            &field.sticky,
-            &i,
-            &anki_id,
-            &tag,                
-        ]).await?;
+        tx.execute(
+            &insert_notetype_field_stmt,
+            &[
+                &id,
+                &cleaned_field_description,
+                &field.font,
+                &cleaned_field_name,
+                &field.ord,
+                &field.rtl,
+                &field.size,
+                &field.sticky,
+                &i,
+                &anki_id,
+                &tag,
+            ],
+        )
+        .await?;
     }
 
-    for (i, template) in notetype.tmpls.iter().enumerate().map(|(i, template)| (i as u32, template)) {
+    for (i, template) in notetype
+        .tmpls
+        .iter()
+        .enumerate()
+        .map(|(i, template)| (i as u32, template))
+    {
         let anki_id = template.id.unwrap_or(0);
         let cleaned_tmpl_name = cleanser::clean(&template.name);
 
-        tx.execute(&insert_notetype_template_stmt, &[
-            &id,
-            &template.qfmt,
-            &template.afmt,
-            &template.bqfmt,
-            &template.bafmt,
-            &template.bfont,
-            &template.bsize,
-            &cleaned_tmpl_name,
-            &i,
-            &anki_id,
-            &template.ord,
-        ]).await?;
+        tx.execute(
+            &insert_notetype_template_stmt,
+            &[
+                &id,
+                &template.qfmt,
+                &template.afmt,
+                &template.bqfmt,
+                &template.bafmt,
+                &template.bfont,
+                &template.bsize,
+                &cleaned_tmpl_name,
+                &i,
+                &anki_id,
+                &template.ord,
+            ],
+        )
+        .await?;
     }
 
     tx.commit().await?;
@@ -355,12 +451,19 @@ pub async fn unpack_notetype(client: &mut SharedConn, notetype: &Notetype, deck:
     Ok(notetype.crowdanki_uuid.clone())
 }
 
-pub async fn delete_unused_notetypes(client: &SharedConn) -> std::result::Result<String, Box<dyn std::error::Error>> {
-    client.query("
-        DELETE FROM notetype CASCADE WHERE id NOT IN (
-                SELECT notetype FROM notes
+pub async fn delete_unused_notetypes(
+    client: &SharedConn,
+) -> std::result::Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    client
+        .query(
+            "
+        DELETE FROM notetype WHERE id NOT IN (
+                SELECT DISTINCT notetype FROM notes
         )
-    ", &[]).await?;
+    ",
+            &[],
+        )
+        .await?;
 
     Ok("Success".into())
 }

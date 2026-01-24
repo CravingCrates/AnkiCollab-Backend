@@ -1,8 +1,4 @@
-
-
-
-
-// Retrieve all media files that belong to a given deck 
+// Retrieve all media files that belong to a given deck
 // pub async fn get_media_files(client: &SharedConn, deck_id: i64) -> std::result::Result<Vec<String>, Box<dyn std::error::Error>> {
 //     let query = "Select fileName from media where deck = $1";
 //     let media_files = client.query(query, &[&deck_id])
@@ -13,7 +9,6 @@
 
 //     Ok(media_files)
 // }
-
 
 // Unpack media files and store them in database
 // pub async fn unpack_media(client: &mut SharedConn, files: &Vec<String>, deck: Option<i64>)-> std::result::Result<String, Box<dyn std::error::Error>> {
