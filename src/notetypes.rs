@@ -272,7 +272,7 @@ pub async fn does_notetype_exist(
                 let id_match = field
                     .id
                     .zip(existing.get::<_, Option<i64>>(1))
-                    .map_or(true, |(a, b)| a == b);
+                    .map_or(false, |(a, b)| a != 0 && b != 0 && a == b);
                 let name_match = field.name == existing.get::<_, String>(0);
                 id_match || name_match
             })
@@ -285,7 +285,7 @@ pub async fn does_notetype_exist(
                     let id_match = template
                         .id
                         .zip(existing.get::<_, Option<i64>>(4))
-                        .map_or(true, |(a, b)| a == b);
+                        .map_or(false, |(a, b)| a != 0 && b != 0 && a == b);
                     let qfmt_match = template.qfmt == existing.get::<_, String>(0);
                     let afmt_match = template.afmt == existing.get::<_, String>(1);
                     let bqfmt_match = template.bqfmt == existing.get::<_, String>(2);
@@ -298,23 +298,7 @@ pub async fn does_notetype_exist(
         if matching_fields && matching_templates {
             return Ok(existing_notetype_guid);
         }
-
-        let dirty_matching_templates = notetype.tmpls.iter().enumerate().all(|(i, template)| {
-            existing_notetype_templates
-                .get(i)
-                .map_or(false, |existing| {
-                    let id_match = template
-                        .id
-                        .zip(existing.get::<_, Option<i64>>(4))
-                        .map_or(true, |(a, b)| a == b);
-                    let name_match = template.name == existing.get::<_, String>(5);
-                    id_match || name_match
-                })
-        });
-        // If not, try to find a notetype that has the same fields and similar templates (Second best case)
-        if matching_fields && dirty_matching_templates {
-            return Ok(existing_notetype_guid);
-        }
+        
     }
     // Give up
     Ok(String::new())

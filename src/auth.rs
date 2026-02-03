@@ -245,6 +245,50 @@ pub async fn get_user_from_token(
     }
 }
 
+// Get username from an access token
+pub async fn get_username_from_token(
+    db_state: &Arc<database::AppState>,
+    token: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    if token.is_empty() {
+        return Err("Token not provided".into());
+    }
+
+    let client = match db_state.db_pool.get().await {
+        Ok(pool) => pool,
+        Err(err) => {
+            println!("Error getting pool: {err}");
+            return Err("Internal Error".into());
+        }
+    };
+
+    let token_hash = hash_token(token);
+
+    let rows = client
+        .query(
+            r#"
+            WITH updated AS (
+                UPDATE auth_tokens
+                SET last_used_at = NOW()
+                WHERE token_hash = $1
+                  AND expires_at > NOW()
+                RETURNING user_id
+            )
+            SELECT users.username
+            FROM users
+            JOIN updated ON users.id = updated.user_id
+            "#,
+            &[&token_hash],
+        )
+        .await?;
+
+    if rows.is_empty() {
+        Err("Token not found or expired".into())
+    } else {
+        Ok(rows[0].get(0))
+    }
+}
+
 // Check if user has permission for a specific deck
 pub async fn is_valid_user_token(
     db_state: &Arc<database::AppState>,

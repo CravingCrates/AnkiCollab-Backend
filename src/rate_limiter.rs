@@ -175,30 +175,47 @@ impl RateLimiter {
         &self,
         db_client: &mut SharedConn,
     ) -> Result<(), tokio_postgres::Error> {
-        let quotas = self.user_quotas.lock().await;
+        let mut quotas = self.user_quotas.lock().await;
         let now = Utc::now();
 
-        let tx = db_client.transaction().await?;
+        let mut stale_user_ids = Vec::new();
 
         for (user_id, quota) in quotas.iter() {
             let storage_used = quota.storage_used.load(Ordering::Relaxed);
             let upload_count = quota.upload_count.load(Ordering::Relaxed);
             let download_count = quota.download_count.load(Ordering::Relaxed);
 
-            tx.execute(
-                "INSERT INTO user_quotas (user_id, storage_used, upload_count, download_count, last_reset) 
-                 VALUES ($1, $2, $3, $4, $5)
-                 ON CONFLICT (user_id) 
-                 DO UPDATE SET 
-                    storage_used = $2, 
-                    upload_count = $3, 
-                    download_count = $4,
-                    last_reset = $5",
-                &[user_id, &(storage_used as i64), &(upload_count as i32), &(download_count as i32), &now]
-            ).await?;
+            // Use a subquery to only insert/update if user exists, avoiding FK violation errors in Postgres logs
+            let rows_affected = db_client
+                .execute(
+                    "INSERT INTO user_quotas (user_id, storage_used, upload_count, download_count, last_reset) 
+                     SELECT $1, $2, $3, $4, $5
+                     WHERE EXISTS (SELECT 1 FROM users WHERE id = $1)
+                     ON CONFLICT (user_id) 
+                     DO UPDATE SET 
+                        storage_used = $2, 
+                        upload_count = $3, 
+                        download_count = $4,
+                        last_reset = $5",
+                    &[
+                        user_id,
+                        &(storage_used as i64),
+                        &(upload_count as i32),
+                        &(download_count as i32),
+                        &now,
+                    ],
+                )
+                .await?;
+
+            // If no rows were affected, the user doesn't exist anymore - mark as stale
+            if rows_affected == 0 {
+                stale_user_ids.push(*user_id);
+            }
         }
 
-        tx.commit().await?;
+        for user_id in stale_user_ids {
+            quotas.remove(&user_id);
+        }
         Ok(())
     }
 

@@ -191,6 +191,11 @@ pub struct TokenInfo {
     pub deck_hash: String,
 }
 
+#[derive(Deserialize)]
+pub struct TokenOnly {
+    pub token: String,
+}
+
 // Media management
 
 #[derive(Debug, Serialize)]

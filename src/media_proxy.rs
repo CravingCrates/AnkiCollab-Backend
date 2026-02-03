@@ -24,7 +24,7 @@ use crate::media_manager::{determine_content_type_by_name, media_bucket, MAX_FIL
 use crate::s3_ops::{self, S3OpError};
 
 const DOWNLOAD_TOKEN_MAX_REUSES: u8 = 3;
-const UPLOAD_TOKEN_MAX_REUSES: u8 = 3; // Allow retries for rate limiting (client has @retry(max_tries=3))
+const UPLOAD_TOKEN_MAX_REUSES: u8 = 6; // Allow extra client retries without tripping replay guard
 
 // CORS allowed origins (matches upload configuration)
 fn get_cors_origin() -> &'static str {

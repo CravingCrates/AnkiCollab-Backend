@@ -59,6 +59,8 @@ use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use std::io::Write;
+use sha2::{Digest, Sha256};
+use hex::encode;
 
 use tower_governor::{
     governor::GovernorConfigBuilder, key_extractor::SmartIpKeyExtractor, GovernorLayer,
@@ -1126,6 +1128,24 @@ pub async fn check_user_token(
     (StatusCode::OK, serde_json::to_string(&res).unwrap())
 }
 
+pub async fn get_user_hash_from_token(
+    State(db_state): State<Arc<AppState>>,
+    Json(info): Json<structs::TokenOnly>,
+) -> impl IntoResponse {
+    match auth::get_username_from_token(&db_state, &info.token).await {
+        Ok(username) => {
+            let mut hasher = Sha256::new();
+            hasher.update(username.as_bytes());
+            let hashed = encode(hasher.finalize());
+            (StatusCode::OK, serde_json::to_string(&hashed).unwrap())
+        }
+        Err(err) => {
+            error::log_expected("get_user_hash_from_token", StatusCode::UNAUTHORIZED, &err.to_string());
+            (StatusCode::UNAUTHORIZED, "Unauthorized".to_string())
+        }
+    }
+}
+
 pub async fn refresh_auth_token(
     State(db_state): State<Arc<AppState>>,
     Json(refresh_req): Json<auth::TokenRefresh>,
@@ -1639,6 +1659,7 @@ async fn main() {
         .route("/UploadDeckStats", post(upload_deck_stats))
         .route("/requestRemoval", post(request_removal))
         .route("/CheckUserToken", post(check_user_token))
+        .route("/GetUserHashFromToken", post(get_user_hash_from_token))
         .route("/refreshToken", post(refresh_auth_token))
         .route(
             "/GetProtectedFields/{deck_hash}",

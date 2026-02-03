@@ -17,6 +17,41 @@ use database::SharedConn;
 
 use async_recursion::async_recursion;
 
+fn extract_db_error(err: &(dyn std::error::Error + 'static)) -> Option<serde_json::Value> {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(err);
+
+    while let Some(err) = current {
+        if let Some(pg_err) = err.downcast_ref::<tokio_postgres::Error>() {
+            if let Some(db_err) = pg_err.as_db_error() {
+                let position = db_err.position().map(|pos| match pos {
+                    tokio_postgres::error::ErrorPosition::Original(p) => {
+                        json!({"kind": "original", "position": p})
+                    }
+                    tokio_postgres::error::ErrorPosition::Internal { position, query } => {
+                        json!({"kind": "internal", "position": position, "query": query})
+                    }
+                });
+
+                return Some(json!({
+                    "code": db_err.code().code().to_string(),
+                    "message": db_err.message(),
+                    "detail": db_err.detail(),
+                    "hint": db_err.hint(),
+                    "table": db_err.table(),
+                    "column": db_err.column(),
+                    "constraint": db_err.constraint(),
+                    "severity": db_err.severity(),
+                    "position": position,
+                }));
+            }
+        }
+
+        current = err.source();
+    }
+
+    None
+}
+
 pub async fn unpack_notes(
     client: &mut SharedConn,
     notes: Vec<&Note>,
@@ -798,9 +833,19 @@ pub async fn unpack_deck_json(
     {
         Ok(_res) => {}
         Err(err) => {
+            let db_details = extract_db_error(err.as_ref());
+            let deck_params = json!({
+                "deck_id": id,
+                "owner": owner,
+                "approved": approved,
+                "commit_id": commit,
+            });
+
             error!(
                 deck_id = ?id,
                 error = %err,
+                db_error = ?db_details,
+                params = ?deck_params,
                 "Error unpacking deck data"
             );
             sentry::with_scope(
@@ -809,6 +854,11 @@ pub async fn unpack_deck_json(
                     scope.set_tag("operation", "unpack_deck_data");
                     scope.set_extra("deck_id", format!("{:?}", id).into());
                     scope.set_extra("commit_id", commit.into());
+                    scope.set_extra("error_chain", format!("{:#}", err).into());
+                    scope.set_extra("deck_params", deck_params.clone().into());
+                    if let Some(db) = db_details {
+                        scope.set_extra("db_error", db.into());
+                    }
                 },
                 || {
                     sentry::capture_message(

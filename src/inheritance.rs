@@ -12,9 +12,12 @@ async fn get_deck_id(
     deck_hash: &str,
 ) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
     let row = client
-        .query_one("SELECT id FROM decks WHERE human_hash = $1", &[&deck_hash])
+        .query_opt("SELECT id FROM decks WHERE human_hash = $1", &[&deck_hash])
         .await?;
-    Ok(row.get(0))
+    match row {
+        Some(r) => Ok(r.get(0)),
+        None => Err(format!("Deck hash {} not found", deck_hash).into()),
+    }
 }
 
 pub async fn create_deck_link(

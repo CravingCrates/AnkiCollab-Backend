@@ -54,12 +54,15 @@ pub mod history {
         actor_user_id: Option<i32>,
     ) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
         let row = tx
-            .query_one(
+            .query_opt(
                 "UPDATE notes SET version = version + 1 WHERE id = $1 RETURNING version",
                 &[&note_id],
             )
             .await?;
-        let version: i64 = row.get(0);
+        let version: i64 = match row {
+            Some(r) => r.get(0),
+            None => return Err(format!("note {note_id} missing while logging event").into()),
+        };
 
         let inserted = tx
             .query_one(

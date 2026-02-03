@@ -98,7 +98,7 @@ fn create_text_preview(bytes: &[u8], max_chars: usize) -> Option<String> {
 }
 
 // Media file type constants
-pub(crate) const MAX_FILE_SIZE_BYTES: usize = 2 * 1024 * 1024; // 2 MB
+pub(crate) const MAX_FILE_SIZE_BYTES: usize = 10 * 1024 * 1024; // 10 MB
 
 const EXTENSION_TO_MIME: [(&str, &str); 12] = [
     ("jpg", "image/jpeg"),
