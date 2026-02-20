@@ -243,12 +243,11 @@ pub async fn does_notetype_exist(
     let check_existing_notetype = client.query("SELECT id, guid, original_stock_kind from notetype where owner = $1 and type = $2 and req = $3", &[&owner, &notetype.type_, &req_json]).await?;
 
     for row in check_existing_notetype {
-        if !notetype
-            .original_stock_kind
-            .zip(row.get::<_, Option<i32>>(2))
-            .map_or(true, |(a, b)| a == b)
-        {
-            continue;
+        let existing_stock_kind: Option<i32> = row.get(2);
+        match (notetype.original_stock_kind, existing_stock_kind) {
+            (Some(a), Some(b)) if a != b => continue,
+            (Some(_), None) | (None, Some(_)) => continue,
+            _ => {}
         }
 
         let existing_notetype_id: i64 = row.get(0);
@@ -278,6 +277,10 @@ pub async fn does_notetype_exist(
             })
         });
 
+        if !matching_fields {
+            continue;
+        }
+
         let matching_templates = notetype.tmpls.iter().enumerate().all(|(i, template)| {
             existing_notetype_templates
                 .get(i)
@@ -297,6 +300,25 @@ pub async fn does_notetype_exist(
         // Try to find a notetype that is exactly the same, (Best case)
         if matching_fields && matching_templates {
             return Ok(existing_notetype_guid);
+        }
+
+        // For ProjektAnki Notetypes we allow dirty template matching because those are managed from the notetype addon
+        if notetype.name.to_lowercase().contains("projektanki") {
+            let dirty_matching_templates = notetype.tmpls.iter().enumerate().all(|(i, template)| {
+                existing_notetype_templates
+                    .get(i)
+                    .map_or(false, |existing| {
+                        let id_match = template
+                            .id
+                            .zip(existing.get::<_, Option<i64>>(4))
+                            .map_or(false, |(a, b)| a != 0 && b != 0 && a == b);
+                        let name_match = template.name == existing.get::<_, String>(5);
+                        id_match || name_match
+                    })
+            });
+            if matching_fields && dirty_matching_templates {
+                return Ok(existing_notetype_guid);
+            }
         }
         
     }
