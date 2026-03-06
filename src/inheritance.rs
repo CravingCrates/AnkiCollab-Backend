@@ -22,15 +22,10 @@ async fn get_deck_id(
 
 pub async fn create_deck_link(
     db_state: &Arc<database::AppState>,
+    user_id: i32,
     req: CreateDeckLinkRequest,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let user_id = auth::get_user_from_token(db_state, &req.token)
-        .await
-        .unwrap_or_default();
-    if user_id == 0 {
-        return Err("Unauthorized".into());
-    }
-    if !auth::is_valid_user_token(&db_state, &req.token, &req.subscriber_deck_hash).await? {
+    if !auth::is_deck_owner_or_maintainer(db_state, user_id, &req.subscriber_deck_hash).await? {
         return Err("Forbidden".into());
     }
 
@@ -179,15 +174,10 @@ async fn get_descendant_deck_ids(
 
 pub async fn create_note_links(
     db_state: &Arc<database::AppState>,
+    user_id: i32,
     req: CreateNewNoteLinkRequest,
 ) -> Result<(usize, Vec<String>), Box<dyn std::error::Error + Send + Sync>> {
-    let user_id = auth::get_user_from_token(db_state, &req.token)
-        .await
-        .unwrap_or_default();
-    if user_id == 0 {
-        return Err("Unauthorized. If you're a maintainer please log-out and log-in again.".into());
-    }
-    if !auth::is_valid_user_token(&db_state, &req.token, &req.subscriber_deck_hash).await? {
+    if !auth::is_deck_owner_or_maintainer(db_state, user_id, &req.subscriber_deck_hash).await? {
         return Err("Forbidden".into());
     }
     let mut client = db_state.db_pool.get_owned().await?;

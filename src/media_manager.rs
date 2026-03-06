@@ -20,7 +20,7 @@ use crate::structs::{
     MediaManifestResponse, MediaMissingFile, MediaProcessedFile, SanitizedSvgItem,
     SvgSanitizeRequest, SvgSanitizeResponse,
 };
-use crate::{auth, media_reference_manager, AppState};
+use crate::{media_reference_manager, AppState};
 use crate::s3_ops;
 
 use lazy_static::lazy_static;
@@ -1001,29 +1001,13 @@ pub async fn start_cleanup_task(state: Arc<AppState>) {
 }
 
 pub async fn check_media_bulk(
+    auth_user: crate::auth::AuthenticatedUser,
     State(state): State<Arc<AppState>>,
     client_ip: ClientIp,
     Json(req): Json<MediaBulkCheckRequest>,
 ) -> Result<Json<MediaBulkCheckResponse>, (StatusCode, String)> {
-    let user_id = auth::get_user_from_token(&state, &req.token)
-        .await
-        .map_err(|_| {
-            sentry::add_breadcrumb(sentry::Breadcrumb {
-                category: Some("media_upload".into()),
-                message: Some("Failed to authenticate user token".to_string()),
-                level: sentry::Level::Warning,
-                ..Default::default()
-            });
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Error authenticating user".to_string(),
-            )
-        })?;
+    let user_id = auth_user.user_id;
 
-    if user_id == 0 {
-        // Expected auth failure - don't log to Sentry (4xx is expected)
-        return Err((StatusCode::UNAUTHORIZED, "Invalid token".to_string()));
-    }
     let ip_address = client_ip.0;
 
     sentry::configure_scope(|scope| {
@@ -2747,40 +2731,13 @@ fn is_allowed_extension_with_logging(filename: &str, user_id: i64) -> bool {
 }
 
 pub async fn get_media_manifest(
+    auth_user: crate::auth::AuthenticatedUser,
     State(state): State<Arc<AppState>>,
     client_ip: ClientIp,
     Json(req): Json<MediaManifestRequest>,
 ) -> Result<Json<MediaManifestResponse>, (StatusCode, String)> {
-    let user_id = auth::get_user_from_token(&state, &req.user_token)
-        .await
-        .map_err(|_| {
-            sentry::add_breadcrumb(sentry::Breadcrumb {
-                category: Some("media_download".into()),
-                message: Some("Failed to authenticate user token for media manifest".to_string()),
-                level: sentry::Level::Warning,
-                ..Default::default()
-            });
-            (
-                StatusCode::UNAUTHORIZED,
-                "Error authenticating user (1)".to_string(),
-            )
-        })?;
+    let user_id = auth_user.user_id;
 
-    if user_id == 0 {
-        sentry::add_breadcrumb(sentry::Breadcrumb {
-            category: Some("media_download".into()),
-            message: Some(format!(
-                "Invalid token for media manifest: IP {}",
-                client_ip.0
-            )),
-            level: sentry::Level::Warning,
-            ..Default::default()
-        });
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            "Error authenticating user (2)".to_string(),
-        ));
-    }
     let ip_address = client_ip.0;
 
     if req.filenames.is_empty() {
@@ -2954,8 +2911,13 @@ pub async fn get_media_manifest(
 }
 
 pub async fn sanitize_svg_batch(
+    auth_user: crate::auth::AuthenticatedUser,
+    State(_state): State<Arc<AppState>>,
     Json(req): Json<SvgSanitizeRequest>,
 ) -> Result<Json<SvgSanitizeResponse>, (StatusCode, String)> {
+    // Auth is already validated by the extractor
+    let _user_id = auth_user.user_id;
+
     // Validate request
     if req.svg_files.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "No SVG files provided".to_string()));

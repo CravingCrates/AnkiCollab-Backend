@@ -5,6 +5,7 @@ use std::sync::Arc;
 pub async fn new(
     db_state: &Arc<database::AppState>,
     info: StatsInfo,
+    user_hash: String,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut client = match db_state.db_pool.get().await {
         Ok(pool) => pool,
@@ -137,7 +138,7 @@ pub async fn new(
              AS t(note_id, retention, lapses, reps)
          ) tu
          WHERE ns.note_id = tu.note_id AND ns.user_hash = $5::varchar",
-        &[&note_ids, &retentions, &lapses, &reps, &info.user_hash],
+        &[&note_ids, &retentions, &lapses, &reps, &user_hash],
     )
     .await?;
 
@@ -155,7 +156,7 @@ pub async fn new(
                  SELECT 1 FROM note_stats ns 
                  WHERE ns.note_id = tu.note_id AND ns.user_hash = $5::varchar
              )",
-            &[&note_ids, &retentions, &lapses, &reps, &info.user_hash],
+            &[&note_ids, &retentions, &lapses, &reps, &user_hash],
         )
         .await?;
     }

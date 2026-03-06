@@ -1,3 +1,6 @@
+use axum::extract::{FromRequestParts, OptionalFromRequestParts};
+use axum::http::request::Parts;
+use axum::http::StatusCode;
 use chrono::serde::ts_seconds;
 use chrono::{DateTime, Duration, Utc};
 use rand::distr::{Alphanumeric, SampleString};
@@ -35,6 +38,76 @@ pub struct TokenRefresh {
 }
 
 use database::SharedConn;
+
+// ── Authenticated user extractor ─────────────────────────────────────
+// Reads `Authorization: Bearer <token>` from request headers.
+// If present and valid, yields `AuthenticatedUser { user_id }`.
+// Use `Option<AuthenticatedUser>` for endpoints where auth is optional.
+
+pub struct AuthenticatedUser {
+    pub user_id: i32,
+}
+
+impl FromRequestParts<Arc<database::AppState>> for AuthenticatedUser {
+    type Rejection = (StatusCode, String);
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &Arc<database::AppState>,
+    ) -> Result<Self, Self::Rejection> {
+        let token = parts
+            .headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .ok_or((
+                StatusCode::UNAUTHORIZED,
+                "Missing or invalid Authorization header".to_string(),
+            ))?;
+
+        let user_id = get_user_from_token(state, token).await.map_err(|_| {
+            (
+                StatusCode::UNAUTHORIZED,
+                "Invalid or expired token".to_string(),
+            )
+        })?;
+
+        if user_id == 0 {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                "Invalid token".to_string(),
+            ));
+        }
+
+        Ok(AuthenticatedUser { user_id })
+    }
+}
+
+/// Optional variant: returns `Ok(None)` when the header is missing or the
+/// token is invalid, instead of rejecting the request outright.
+impl OptionalFromRequestParts<Arc<database::AppState>> for AuthenticatedUser {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &Arc<database::AppState>,
+    ) -> Result<Option<Self>, Self::Rejection> {
+        let token = match parts
+            .headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+        {
+            Some(t) => t.to_owned(),
+            None => return Ok(None),
+        };
+
+        match get_user_from_token(state, &token).await {
+            Ok(user_id) if user_id > 0 => Ok(Some(AuthenticatedUser { user_id })),
+            _ => Ok(None),
+        }
+    }
+}
 
 // Generate a secure random token of specified length
 fn generate_secure_token(length: usize) -> String {
@@ -366,4 +439,83 @@ pub async fn cleanup_expired_tokens(
         .await?;
 
     Ok(result)
+}
+
+// ── Helper functions for the new extractor-based auth ─────────────────
+
+/// Get username by user ID (used after AuthenticatedUser extraction)
+pub async fn get_username_by_user_id(
+    db_state: &Arc<database::AppState>,
+    user_id: i32,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let client = db_state.db_pool.get().await?;
+    let row = client
+        .query_one("SELECT username FROM users WHERE id = $1", &[&user_id])
+        .await?;
+    Ok(row.get(0))
+}
+
+/// Check if a user (by ID) is an owner or maintainer of a deck (by human_hash).
+/// Equivalent to `is_valid_user_token` but works with user_id directly,
+/// avoiding a redundant token lookup.
+pub async fn is_deck_owner_or_maintainer(
+    db_state: &Arc<database::AppState>,
+    user_id: i32,
+    deck_hash: &str,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let client = db_state.db_pool.get().await?;
+
+    let rows = client
+        .query(
+            "
+        WITH RECURSIVE deck_ancestors AS (
+            SELECT id, parent, owner
+            FROM decks
+            WHERE human_hash = $2
+            UNION
+            SELECT d.id, d.parent, d.owner
+            FROM decks d
+            INNER JOIN deck_ancestors da ON da.parent = d.id
+        )
+        SELECT 1 AS access
+        FROM (
+            SELECT 1 AS access
+            FROM decks d
+            INNER JOIN deck_ancestors da ON da.id = d.id
+            WHERE d.owner = $1 OR EXISTS (
+                SELECT 1 FROM maintainers m WHERE m.deck = d.id AND m.user_id = $1
+            )
+            UNION
+            SELECT 1 AS access
+            FROM maintainers m
+            INNER JOIN deck_ancestors da ON da.id = m.deck
+            WHERE m.user_id = $1
+        ) AS access_subquery
+        ",
+            &[&user_id, &deck_hash],
+        )
+        .await?;
+
+    Ok(!rows.is_empty())
+}
+
+/// Remove all auth tokens for a user (used with AuthenticatedUser extractor)
+pub async fn remove_token_by_user_id(
+    db_state: &Arc<database::AppState>,
+    user_id: i32,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let client = db_state.db_pool.get().await?;
+
+    let result = client
+        .execute(
+            "DELETE FROM auth_tokens WHERE user_id = $1",
+            &[&user_id],
+        )
+        .await?;
+
+    if result == 0 {
+        return Ok("Token not found".into());
+    }
+
+    Ok("Token successfully removed".into())
 }

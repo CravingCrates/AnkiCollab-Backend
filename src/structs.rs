@@ -126,7 +126,6 @@ pub struct UpdateInfoResponse {
 #[derive(Deserialize, Serialize)]
 pub struct CreateDeckReq {
     pub deck: String,
-    pub username: String,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -137,7 +136,6 @@ pub struct SubmitCardReq {
     pub deck: String,     // JSON String of the actual deck content
     pub rationale: i32,   // Enum. See elsewhere
     pub commit_text: String, // (optional) additional info
-    pub token: String,
     pub force_overwrite: bool,
 }
 
@@ -146,7 +144,6 @@ pub struct NoteRemovalReq {
     pub remote_deck: String, // Topmost deck that contains all the notes with the guids. This is required because multiple decks might use a card
     pub note_guids: Vec<String>,
     pub commit_text: String,
-    pub token: String,
     pub force_overwrite: bool,
 }
 
@@ -154,7 +151,6 @@ pub struct NoteRemovalReq {
 pub struct SubmitChangelog {
     pub deck_hash: String,
     pub changelog: String,
-    pub token: String,
 }
 
 #[derive(Deserialize)]
@@ -165,7 +161,6 @@ pub struct CheckDeckAliveRequest {
 #[derive(Deserialize)]
 pub struct SubscriptionRequest {
     pub deck_hash: String,
-    pub user_hash: String,
 }
 
 #[derive(Deserialize)]
@@ -180,20 +175,13 @@ type DeckReview = HashMap<String, NoteReview>; // HashMap<DeckName, NoteReview>
 
 #[derive(Deserialize)]
 pub struct StatsInfo {
-    pub user_hash: String,
     pub deck_hash: String,
     pub review_history: DeckReview,
 }
 
 #[derive(Deserialize)]
-pub struct TokenInfo {
-    pub token: String,
+pub struct DeckHashOnly {
     pub deck_hash: String,
-}
-
-#[derive(Deserialize)]
-pub struct TokenOnly {
-    pub token: String,
 }
 
 // Media management
@@ -206,7 +194,6 @@ pub struct MediaDownloadItem {
 
 #[derive(Debug, Deserialize)]
 pub struct MediaManifestRequest {
-    pub user_token: String,
     pub deck_hash: String,
     pub filenames: Vec<String>,
 }
@@ -258,7 +245,6 @@ pub struct MediaProcessedFile {
 
 #[derive(Debug, Deserialize)]
 pub struct MediaBulkCheckRequest {
-    pub token: String,
     pub deck_hash: String,
     pub files: Vec<MediaFileInfo>,
     pub bulk_operation_id: Option<String>,
@@ -306,7 +292,6 @@ pub struct SvgSanitizeResponse {
 pub struct CreateDeckLinkRequest {
     pub subscriber_deck_hash: String,
     pub base_deck_hash: String,
-    pub token: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -314,7 +299,6 @@ pub struct CreateNewNoteLinkRequest {
     pub subscriber_deck_hash: String,
     pub base_deck_hash: String,
     pub note_guids: Vec<String>,
-    pub token: String,
 }
 
 #[derive(Deserialize)]

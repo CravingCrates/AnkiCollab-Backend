@@ -50,6 +50,7 @@ use axum::{
     Json,
 };
 use axum_client_ip::{ClientIp, ClientIpSource};
+use auth::AuthenticatedUser;
 
 use std::fs;
 use std::net::SocketAddr;
@@ -73,6 +74,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 async fn create_deck_link(
+    auth_user: AuthenticatedUser,
     State(db_state): State<Arc<AppState>>,
     Json(req): Json<structs::CreateDeckLinkRequest>,
 ) -> impl IntoResponse {
@@ -83,13 +85,14 @@ async fn create_deck_link(
         );
     }
 
-    match inheritance::create_deck_link(&db_state, req).await {
+    match inheritance::create_deck_link(&db_state, auth_user.user_id, req).await {
         Ok(()) => (StatusCode::OK, "Success".to_string()),
         Err(e) => (StatusCode::UNAUTHORIZED, e.to_string()),
     }
 }
 
 async fn create_note_links(
+    auth_user: AuthenticatedUser,
     State(db_state): State<Arc<AppState>>,
     Json(req): Json<structs::CreateNewNoteLinkRequest>,
 ) -> impl IntoResponse {
@@ -100,7 +103,7 @@ async fn create_note_links(
         );
     }
 
-    match inheritance::create_note_links(&db_state, req).await {
+    match inheritance::create_note_links(&db_state, auth_user.user_id, req).await {
         Ok((linked, skipped)) => {
             let payload = serde_json::json!({"linked": linked, "skipped": skipped});
             (StatusCode::OK, serde_json::to_string(&payload).unwrap())
@@ -170,6 +173,8 @@ fn decompress_data(engine: &general_purpose::GeneralPurpose, data: &str) -> Resu
     // Standard decoding path: base64 -> gzip -> UTF-8 JSON
     // Client sends: gzip.compress(json.dumps(data).encode('utf-8')) -> base64.b64encode()
 
+    const MAX_DECOMPRESSED_SIZE: u64 = 250 * 1024 * 1024; // 250 MB limit
+
     let trimmed = data.trim();
 
     // Decode base64
@@ -186,13 +191,13 @@ fn decompress_data(engine: &general_purpose::GeneralPurpose, data: &str) -> Resu
             level: sentry::Level::Warning,
             ..Default::default()
         });
-        format!("base64 decode error: {e}")
+        "Decoding error".to_string()
     })?;
 
-    // Decompress gzip
-    let mut decoder = GzDecoder::new(&bytes[..]);
+    // Decompress gzip with size limit to prevent zip bombs
+    let decoder = GzDecoder::new(&bytes[..]);
     let mut decoded_data = String::new();
-    decoder.read_to_string(&mut decoded_data).map_err(|e| {
+    decoder.take(MAX_DECOMPRESSED_SIZE).read_to_string(&mut decoded_data).map_err(|e| {
         sentry::add_breadcrumb(sentry::Breadcrumb {
             category: Some("decode".into()),
             message: Some(format!(
@@ -203,14 +208,19 @@ fn decompress_data(engine: &general_purpose::GeneralPurpose, data: &str) -> Resu
             level: sentry::Level::Warning,
             ..Default::default()
         });
-        format!("gzip decode error: {e}")
+        "Decompression error".to_string()
     })?;
+
+    if decoded_data.len() as u64 >= MAX_DECOMPRESSED_SIZE {
+        return Err("Decompressed data exceeds size limit".to_string());
+    }
 
     Ok(decoded_data)
 }
 
 // Handler to submit card suggestions; runs background work on the Tokio runtime.
 pub async fn process_card(
+    auth_user: Option<AuthenticatedUser>,
     ClientIp(iip): ClientIp,
     State(state): State<Arc<AppState>>,
     deck: String,
@@ -218,6 +228,7 @@ pub async fn process_card(
     let (tx, rx) = tokio::sync::oneshot::channel::<(StatusCode, String)>();
     let state_cloned = state.clone();
     let ip = iip.to_string();
+    let authed_user_id = auth_user.map(|u| u.user_id);
     tokio::spawn(async move {
         let send = |pair: (StatusCode, String)| {
             let _ = tx.send(pair);
@@ -266,11 +277,7 @@ pub async fn process_card(
             }
         };
 
-        let committing_user: Option<i32> =
-            match auth::get_user_from_token(&state_cloned, &info.token).await {
-                Ok(u) => Some(u),
-                Err(_) => None,
-            };
+        let committing_user: Option<i32> = authed_user_id;
         let commit_id = match suggestion::create_new_commit(
             &state_cloned,
             info.rationale,
@@ -290,11 +297,16 @@ pub async fn process_card(
             }
         };
 
-        let access_token =
-            (auth::is_valid_user_token(&state_cloned, &info.token, &info.remote_deck).await)
-                .unwrap_or_default();
+        let is_owner_or_maintainer = match authed_user_id {
+            Some(uid) => {
+                auth::is_deck_owner_or_maintainer(&state_cloned, uid, &info.remote_deck)
+                    .await
+                    .unwrap_or_default()
+            }
+            None => false,
+        };
         let mut force_overwrite = false;
-        if access_token {
+        if is_owner_or_maintainer {
             force_overwrite = info.force_overwrite;
         }
 
@@ -458,7 +470,7 @@ pub async fn process_card(
 }
 async fn post_login(
     State(db_state): State<Arc<AppState>>,
-    form: axum::Form<auth::Login>,
+    Json(form): Json<auth::Login>,
 ) -> impl IntoResponse {
     match auth::login(&db_state, &form).await {
         Ok(res) => {
@@ -473,10 +485,10 @@ async fn post_login(
 }
 
 pub async fn remove_token(
+    auth_user: AuthenticatedUser,
     State(db_state): State<Arc<AppState>>,
-    Path(token): Path<String>,
 ) -> impl IntoResponse {
-    match auth::remove_token(&db_state, &token).await {
+    match auth::remove_token_by_user_id(&db_state, auth_user.user_id).await {
         Ok(res) => (StatusCode::OK, res),
         Err(_error) => {
             // Token not found or already removed - expected behavior
@@ -486,6 +498,7 @@ pub async fn remove_token(
 }
 
 pub async fn upload_deck_stats(
+    auth_user: AuthenticatedUser,
     State(state): State<Arc<AppState>>,
     deck: String,
 ) -> impl IntoResponse {
@@ -517,12 +530,23 @@ pub async fn upload_deck_stats(
         );
     }
 
+    // Derive user_hash from authenticated user
+    let username = match auth::get_username_by_user_id(&state, auth_user.user_id).await {
+        Ok(u) => u,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Could not resolve user".to_string()),
+    };
+    let user_hash = {
+        let mut hasher = Sha256::new();
+        hasher.update(username.as_bytes());
+        encode(hasher.finalize())
+    };
+
     let db_state_clone = Arc::clone(&state);
     let deck_hash_for_error = info.deck_hash.clone();
 
     // Run on the Tokio runtime
     tokio::spawn(async move {
-        match stats::new(&db_state_clone, info).await {
+        match stats::new(&db_state_clone, info, user_hash).await {
             Ok(()) => {}
             Err(err) => {
                 // Stats insertion failure is usually not critical, but worth logging
@@ -542,6 +566,7 @@ pub async fn upload_deck_stats(
 }
 
 pub async fn confirm_media_bulk_async(
+    _auth_user: AuthenticatedUser,
     State(state): State<Arc<AppState>>,
     Json(req): Json<structs::MediaBulkConfirmRequest>,
 ) -> impl IntoResponse {
@@ -566,6 +591,13 @@ pub async fn check_for_update(
     Json(input): Json<HashMap<String, structs::UpdateInfo>>,
 ) -> impl IntoResponse {
     let mut responses: Vec<Value> = Vec::with_capacity(input.iter().len());
+
+    if input.len() > 50 {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Too many deck entries".to_string(),
+        );
+    }
 
     // if there is just one entry and its not a valid deck hash, return bad request
     if input.len() == 1 {
@@ -737,6 +769,7 @@ fn extract_all_note_guids(deck: &structs::AnkiDeck) -> Vec<String> {
 }
 
 pub async fn post_data(
+    auth_user: AuthenticatedUser,
     ClientIp(iip): ClientIp,
     State(state): State<Arc<AppState>>,
     deck: String,
@@ -763,14 +796,7 @@ pub async fn post_data(
         Err(_) => return (StatusCode::BAD_REQUEST, "Invalid data".to_string()),
     };
 
-    let owner_id = (pull::get_id_from_username(&state, info.username).await).unwrap_or_default();
-
-    if owner_id == 0 {
-        return (
-            StatusCode::OK,
-            r#"{ "status": 0, "message": "Unknown username" }"#.to_string(),
-        );
-    }
+    let owner_id = auth_user.user_id;
 
     let anki_deck = match structs::AnkiDeck::from_json_string(&info.deck) {
         Ok(deck) => deck,
@@ -909,6 +935,7 @@ pub async fn post_data(
 }
 
 pub async fn request_removal(
+    auth_user: Option<AuthenticatedUser>,
     ClientIp(iip): ClientIp,
     State(db_state): State<Arc<AppState>>,
     Json(form): Json<structs::NoteRemovalReq>,
@@ -928,19 +955,23 @@ pub async fn request_removal(
 
     let ip = iip.to_string();
 
-    let access_token = (auth::is_valid_user_token(&db_state, &info.token, &info.remote_deck).await)
-        .unwrap_or_default();
+    let authed_user_id = auth_user.map(|u| u.user_id);
+
+    let is_owner_or_maintainer = match authed_user_id {
+        Some(uid) => {
+            auth::is_deck_owner_or_maintainer(&db_state, uid, &info.remote_deck)
+                .await
+                .unwrap_or_default()
+        }
+        None => false,
+    };
 
     let mut force_overwrite = false;
-    if access_token {
+    if is_owner_or_maintainer {
         force_overwrite = info.force_overwrite;
     }
 
-    let committing_user: Option<i32> = match auth::get_user_from_token(&db_state, &info.token).await
-    {
-        Ok(user) => Some(user),
-        Err(_error) => None,
-    };
+    let committing_user: Option<i32> = authed_user_id;
 
     match note_removal::new(
         &db_state,
@@ -998,6 +1029,7 @@ pub async fn check_deck_alive(
 }
 
 pub async fn add_subscription(
+    auth_user: AuthenticatedUser,
     State(db_state): State<Arc<AppState>>,
     Json(request): Json<structs::SubscriptionRequest>,
 ) -> impl IntoResponse {
@@ -1008,8 +1040,18 @@ pub async fn add_subscription(
         );
     }
 
+    // Derive user_hash from authenticated user
+    let username = match auth::get_username_by_user_id(&db_state, auth_user.user_id).await {
+        Ok(u) => u,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Could not resolve user".to_string()),
+    };
+    let user_hash = {
+        let mut hasher = Sha256::new();
+        hasher.update(username.as_bytes());
+        encode(hasher.finalize())
+    };
+
     let deck_hash = request.deck_hash;
-    let user_hash = request.user_hash;
     match subscription::add(&db_state, deck_hash, user_hash).await {
         Ok(res) => (StatusCode::OK, format!("{:?}", res)),
         Err(error) => {
@@ -1020,6 +1062,7 @@ pub async fn add_subscription(
     }
 }
 pub async fn remove_subscription(
+    auth_user: AuthenticatedUser,
     State(db_state): State<Arc<AppState>>,
     Json(request): Json<structs::SubscriptionRequest>,
 ) -> impl IntoResponse {
@@ -1030,8 +1073,18 @@ pub async fn remove_subscription(
         );
     }
 
+    // Derive user_hash from authenticated user
+    let username = match auth::get_username_by_user_id(&db_state, auth_user.user_id).await {
+        Ok(u) => u,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Could not resolve user".to_string()),
+    };
+    let user_hash = {
+        let mut hasher = Sha256::new();
+        hasher.update(username.as_bytes());
+        encode(hasher.finalize())
+    };
+
     let deck_hash = request.deck_hash;
-    let user_hash = request.user_hash;
     match subscription::remove(&db_state, deck_hash, user_hash).await {
         Ok(res) => (StatusCode::OK, format!("{:?}", res)),
         Err(error) => {
@@ -1071,6 +1124,7 @@ pub async fn get_deck_timestamp(
 }
 
 pub async fn submit_changelog(
+    auth_user: AuthenticatedUser,
     State(db_state): State<Arc<AppState>>,
     Json(changelog_data): Json<structs::SubmitChangelog>,
 ) -> impl IntoResponse {
@@ -1082,11 +1136,11 @@ pub async fn submit_changelog(
     }
 
     // check if they are authorized to add a changelog message to this deck
-    let access_token =
-        (auth::is_valid_user_token(&db_state, &changelog_data.token, &changelog_data.deck_hash)
-            .await)
+    let is_authorized =
+        auth::is_deck_owner_or_maintainer(&db_state, auth_user.user_id, &changelog_data.deck_hash)
+            .await
             .unwrap_or_default();
-    if !access_token {
+    if !is_authorized {
         return (
             StatusCode::UNAUTHORIZED,
             "You are not authorized to add a changelog message to this deck".to_string(),
@@ -1118,21 +1172,19 @@ pub async fn submit_changelog(
 }
 
 pub async fn check_user_token(
-    State(db_state): State<Arc<AppState>>,
-    Json(info): Json<structs::TokenInfo>,
+    auth_user: Option<AuthenticatedUser>,
+    State(_db_state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    let quer = auth::get_user_from_token(&db_state, &info.token)
-        .await
-        .unwrap_or_default();
-    let res = quer > 0;
+    // If the extractor succeeded, the token is valid
+    let res = auth_user.is_some();
     (StatusCode::OK, serde_json::to_string(&res).unwrap())
 }
 
 pub async fn get_user_hash_from_token(
+    auth_user: AuthenticatedUser,
     State(db_state): State<Arc<AppState>>,
-    Json(info): Json<structs::TokenOnly>,
 ) -> impl IntoResponse {
-    match auth::get_username_from_token(&db_state, &info.token).await {
+    match auth::get_username_by_user_id(&db_state, auth_user.user_id).await {
         Ok(username) => {
             let mut hasher = Sha256::new();
             hasher.update(username.as_bytes());
@@ -1140,8 +1192,8 @@ pub async fn get_user_hash_from_token(
             (StatusCode::OK, serde_json::to_string(&hashed).unwrap())
         }
         Err(err) => {
-            error::log_expected("get_user_hash_from_token", StatusCode::UNAUTHORIZED, &err.to_string());
-            (StatusCode::UNAUTHORIZED, "Unauthorized".to_string())
+            error::log_expected("get_user_hash_from_token", StatusCode::INTERNAL_SERVER_ERROR, &err.to_string());
+            (StatusCode::INTERNAL_SERVER_ERROR, "Could not resolve user".to_string())
         }
     }
 }
@@ -1276,6 +1328,7 @@ async fn get_bucket_size(s3_client: &S3Client, s3_throttle: &S3Throttle, bucket:
 }
 
 async fn get_all_deck_missing_media(
+    auth_user: AuthenticatedUser,
     State(state): State<Arc<AppState>>,
     Path(deck_hash): Path<String>,
 ) -> impl IntoResponse {
@@ -1293,6 +1346,12 @@ async fn get_all_deck_missing_media(
             return (StatusCode::INTERNAL_SERVER_ERROR, "[]".to_string());
         }
     };
+
+    match auth::is_deck_owner_or_maintainer(&state, auth_user.user_id, &deck_hash).await {
+        Ok(true) => {},
+        _ => return (StatusCode::FORBIDDEN, "Not authorized".to_string()),
+    }
+
     let media_files = media_reference_manager::get_missing_media(&client, &deck_hash)
         .await
         .unwrap_or_else(|_| vec![]);
@@ -1645,8 +1704,8 @@ async fn main() {
     // Build our application with routes
     let app = Router::new()
         .route("/pullChanges", post(check_for_update))
-        .route("/createDeck", post(post_data))
-        .route("/submitCard", post(process_card))
+        .route("/createDeck", post(post_data).layer(axum::extract::DefaultBodyLimit::max(250 * 1024 * 1024))) // 250 MB for deck creation
+        .route("/submitCard", post(process_card).layer(axum::extract::DefaultBodyLimit::max(250 * 1024 * 1024))) // 250 MB for card submission
         .route("/CheckDeckAlive", post(check_deck_alive))
         .route("/AddSubscription", post(add_subscription))
         .route("/RemoveSubscription", post(remove_subscription))
@@ -1655,8 +1714,8 @@ async fn main() {
         .route("/CreateDeckLink", post(create_deck_link))
         .route("/CreateNewNoteLink", post(create_note_links))
         .route("/login", post(post_login))
-        .route("/removeToken/{token}", get(remove_token))
-        .route("/UploadDeckStats", post(upload_deck_stats))
+        .route("/removeToken", post(remove_token))
+        .route("/UploadDeckStats", post(upload_deck_stats).layer(axum::extract::DefaultBodyLimit::max(50 * 1024 * 1024))) // 50 MB for stats
         .route("/requestRemoval", post(request_removal))
         .route("/CheckUserToken", post(check_user_token))
         .route("/GetUserHashFromToken", post(get_user_hash_from_token))
@@ -1669,15 +1728,15 @@ async fn main() {
         // standard rate limiting - applied to all routes EXCEPT media proxy
         .layer(GovernorLayer::new(global_governor_conf))
         .merge(match &media_governor_layer {
-            Some(layer) => media_proxy::routes().layer(layer.clone()),
-            None => media_proxy::routes(),
+            Some(layer) => media_proxy::routes().layer(layer.clone()).layer(axum::extract::DefaultBodyLimit::max(12 * 1024 * 1024)), // 12 MB per media file
+            None => media_proxy::routes().layer(axum::extract::DefaultBodyLimit::max(12 * 1024 * 1024)),
         })
         .merge(match &media_governor_layer {
             Some(layer) => cache_proxy::routes().layer(layer.clone()),
             None => cache_proxy::routes(),
         })
         .with_state(state)
-        .layer(axum::extract::DefaultBodyLimit::disable())
+        .layer(axum::extract::DefaultBodyLimit::max(250 * 1024 * 1024)) // 250 MB default for all routes
         .layer((
             TraceLayer::new_for_http()
                 .on_request(())
