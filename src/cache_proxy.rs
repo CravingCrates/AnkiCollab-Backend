@@ -53,20 +53,31 @@ async fn download_cache_object(
         .content_type
         .unwrap_or_else(|| infer_content_type(&claims.s3_key).to_string());
 
-    let body = Body::from_stream(ReaderStream::new(object.body.into_async_read()));
+    let content_length = object.content_length();
 
-    Response::builder()
+    let mut builder = Response::builder()
         .status(StatusCode::OK)
         .header("Content-Type", content_type)
         .header("Cache-Control", "public, max-age=3600")
-        .header("Access-Control-Allow-Origin", "*")
-        .body(body)
-        .map_err(|_| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Internal error".to_string(),
-            )
-        })
+        .header("Access-Control-Allow-Origin", "*");
+
+    if let Some(length) = content_length {
+        if length > 0 {
+            builder = builder.header(
+                axum::http::header::CONTENT_LENGTH,
+                length.to_string(),
+            );
+        }
+    }
+
+    let body = Body::from_stream(ReaderStream::new(object.body.into_async_read()));
+
+    builder.body(body).map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Internal error".to_string(),
+        )
+    })
 }
 
 fn infer_content_type(key: &str) -> &'static str {
