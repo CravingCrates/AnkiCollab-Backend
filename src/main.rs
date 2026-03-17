@@ -15,6 +15,7 @@ pub mod media_manager;
 pub mod media_proxy;
 pub mod media_reference_manager;
 pub mod media_tokens;
+pub mod notifications;
 pub mod note_removal;
 pub mod notetypes;
 pub mod pull;
@@ -43,7 +44,7 @@ use tower_http::{
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post, Router},
@@ -321,7 +322,7 @@ pub async fn process_card(
             Ok(val) => val,
             Err(_) => {
                 send((
-                    StatusCode::INTERNAL_SERVER_ERROR,
+                    StatusCode::BAD_REQUEST,
                     "Invalid Deck Name".to_string(),
                 ));
                 return;
@@ -935,7 +936,7 @@ pub async fn post_data(
 }
 
 pub async fn request_removal(
-    auth_user: Option<AuthenticatedUser>,
+    auth_user: AuthenticatedUser,
     ClientIp(iip): ClientIp,
     State(db_state): State<Arc<AppState>>,
     Json(form): Json<structs::NoteRemovalReq>,
@@ -955,23 +956,19 @@ pub async fn request_removal(
 
     let ip = iip.to_string();
 
-    let authed_user_id = auth_user.map(|u| u.user_id);
+    let user_id = auth_user.user_id;
 
-    let is_owner_or_maintainer = match authed_user_id {
-        Some(uid) => {
-            auth::is_deck_owner_or_maintainer(&db_state, uid, &info.remote_deck)
-                .await
-                .unwrap_or_default()
-        }
-        None => false,
-    };
+    let is_owner_or_maintainer =
+        auth::is_deck_owner_or_maintainer(&db_state, user_id, &info.remote_deck)
+            .await
+            .unwrap_or_default();
 
     let mut force_overwrite = false;
     if is_owner_or_maintainer {
         force_overwrite = info.force_overwrite;
     }
 
-    let committing_user: Option<i32> = authed_user_id;
+    let committing_user: Option<i32> = Some(user_id);
 
     match note_removal::new(
         &db_state,
@@ -1172,12 +1169,10 @@ pub async fn submit_changelog(
 }
 
 pub async fn check_user_token(
-    auth_user: Option<AuthenticatedUser>,
+    _auth_user: AuthenticatedUser,
     State(_db_state): State<Arc<AppState>>,
-) -> impl IntoResponse {
-    // If the extractor succeeded, the token is valid
-    let res = auth_user.is_some();
-    (StatusCode::OK, serde_json::to_string(&res).unwrap())
+) -> impl IntoResponse { 
+    (StatusCode::OK, serde_json::to_string(&true).unwrap())
 }
 
 pub async fn get_user_hash_from_token(
@@ -1212,6 +1207,115 @@ pub async fn refresh_auth_token(
                 println!("Error occurred: {error}");
             }
             (StatusCode::UNAUTHORIZED, "Error".to_string())
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct NotificationHistoryQuery {
+    offset: Option<i64>,
+    limit: Option<i64>,
+}
+
+async fn api_get_notifications(
+    auth_user: AuthenticatedUser,
+    State(db_state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    match notifications::get_unread_grouped(&db_state, auth_user.user_id).await {
+        Ok(payload) => (StatusCode::OK, Json(payload)).into_response(),
+        Err(err) => {
+            error::log_expected("api_get_notifications", StatusCode::INTERNAL_SERVER_ERROR, &err);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "Failed to fetch notifications"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn api_get_notifications_history(
+    auth_user: AuthenticatedUser,
+    State(db_state): State<Arc<AppState>>,
+    Query(params): Query<NotificationHistoryQuery>,
+) -> impl IntoResponse {
+    let offset = params.offset.unwrap_or(0).max(0);
+    let limit = params.limit.unwrap_or(50).clamp(1, 200);
+
+    match notifications::get_history(&db_state, auth_user.user_id, offset, limit).await {
+        Ok(payload) => (StatusCode::OK, Json(payload)).into_response(),
+        Err(err) => {
+            error::log_expected(
+                "api_get_notifications_history",
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &err,
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "Failed to fetch notification history"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn api_mark_notifications_read(
+    auth_user: AuthenticatedUser,
+    State(db_state): State<Arc<AppState>>,
+    Json(payload): Json<structs::NotificationMarkReadRequest>,
+) -> impl IntoResponse {
+    if payload.ids.len() > notifications::MAX_MARK_READ_IDS {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("Too many IDs (max {})", notifications::MAX_MARK_READ_IDS)})),
+        )
+            .into_response();
+    }
+    match notifications::mark_read(&db_state, auth_user.user_id, &payload.ids).await {
+        Ok(updated) => {
+            let body = structs::NotificationMarkReadResponse { updated };
+            (StatusCode::OK, Json(body)).into_response()
+        }
+        Err(err) => {
+            error::log_expected(
+                "api_mark_notifications_read",
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &err,
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "Failed to mark notifications"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn api_get_commit_snapshot(
+    auth_user: AuthenticatedUser,
+    State(db_state): State<Arc<AppState>>,
+    Path(commit_id): Path<i32>,
+) -> impl IntoResponse {
+    match notifications::get_commit_snapshot(&db_state, commit_id, auth_user.user_id).await {
+        Ok(payload) => (StatusCode::OK, Json(payload)).into_response(),
+        Err(err) => {
+            if err == "Commit not found" {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": "Commit not found"})),
+                )
+                    .into_response();
+            }
+            error::log_expected(
+                "api_get_commit_snapshot",
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &err,
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "Failed to fetch commit snapshot"})),
+            )
+                .into_response()
         }
     }
 }
@@ -1720,6 +1824,10 @@ async fn main() {
         .route("/CheckUserToken", post(check_user_token))
         .route("/GetUserHashFromToken", post(get_user_hash_from_token))
         .route("/refreshToken", post(refresh_auth_token))
+        .route("/GetNotifications", get(api_get_notifications))
+        .route("/GetNotificationsHistory", get(api_get_notifications_history))
+        .route("/MarkNotificationsRead", post(api_mark_notifications_read))
+        .route("/GetCommitSnapshot/{commit_id}", get(api_get_commit_snapshot))
         .route(
             "/GetProtectedFields/{deck_hash}",
             get(get_protected_fields_from_deck),

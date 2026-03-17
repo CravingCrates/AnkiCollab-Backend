@@ -306,3 +306,102 @@ pub struct LatestPointer {
     pub version_ts: String,
     pub manifest_key: String,
 }
+
+#[derive(Debug, Serialize)]
+pub struct NotificationItem {
+    pub id: i32,
+    pub commit_id: i32,
+    pub deck_id: i64,
+    pub deck_name: String,
+    pub status: String,
+    pub reason: Option<String>,
+    pub created_at: String,
+    pub is_read: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct NotificationDeckGroup {
+    pub deck_id: i64,
+    pub deck_name: String,
+    pub approved_count: i64,
+    pub denied_count: i64,
+    pub notifications: Vec<NotificationItem>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct NotificationUnreadResponse {
+    pub unread_count: i64,
+    pub groups: Vec<NotificationDeckGroup>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct NotificationHistoryResponse {
+    pub total: i64,
+    pub offset: i64,
+    pub limit: i64,
+    pub items: Vec<NotificationItem>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct NotificationMarkReadRequest {
+    pub ids: Vec<i32>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct NotificationMarkReadResponse {
+    pub updated: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CommitFieldChange {
+    pub note_id: i64,
+    pub position: i32,
+    pub previous_content: Option<String>,
+    pub suggested_content: String,
+    pub reviewed: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CommitTagChange {
+    pub note_id: i64,
+    pub content: String,
+    pub action: bool,
+    pub reviewed: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CommitMoveChange {
+    pub note_id: i64,
+    pub from_deck: Option<String>,
+    pub to_deck: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CommitSnapshotEvent {
+    pub note_id: i64,
+    pub note_guid: Option<String>,
+    pub version: i64,
+    pub event_type: String,
+    pub field_name: Option<String>,
+    pub created_at: String,
+    pub old_text: Option<String>,
+    pub new_text: Option<String>,
+    pub diff_html: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CommitSnapshotResponse {
+    pub commit_id: i32,
+    pub rationale: i32,
+    pub info: String,
+    pub timestamp: String,
+    pub deck_name: String,
+    pub author: String,
+    pub field_changes: Vec<CommitFieldChange>,
+    pub tag_changes: Vec<CommitTagChange>,
+    pub deleted_note_ids: Vec<i64>,
+    pub move_changes: Vec<CommitMoveChange>,
+    pub events: Vec<CommitSnapshotEvent>,
+    pub decision_status: Option<String>,
+    pub decision_reason: Option<String>,
+}
