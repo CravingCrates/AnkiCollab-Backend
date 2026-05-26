@@ -14,6 +14,7 @@ use tokio::io::AsyncReadExt;
 
 use crate::media_logger::{self, MediaOperationType};
 use crate::media_tokens::{DownloadTokenParams, UploadTokenParams};
+use crate::s3_ops;
 use crate::structs::{
     MediaBulkCheckRequest, MediaBulkCheckResponse, MediaBulkConfirmRequest,
     MediaBulkConfirmResponse, MediaDownloadItem, MediaExistingFile, MediaManifestRequest,
@@ -21,7 +22,6 @@ use crate::structs::{
     SvgSanitizeRequest, SvgSanitizeResponse,
 };
 use crate::{media_reference_manager, AppState};
-use crate::s3_ops;
 
 use lazy_static::lazy_static;
 use std::env::var;
@@ -51,11 +51,11 @@ pub fn anonymize_filename(filename: &str) -> String {
 fn create_byte_preview(bytes: &[u8], max_bytes: usize) -> String {
     let preview_len = bytes.len().min(max_bytes);
     let preview_bytes = &bytes[..preview_len];
-    
+
     // Create a mixed representation: printable ASCII chars shown as-is, others as hex
     let mut result = String::with_capacity(preview_len * 4);
     result.push_str("[");
-    
+
     for (i, &b) in preview_bytes.iter().enumerate() {
         if i > 0 {
             result.push(' ');
@@ -72,7 +72,7 @@ fn create_byte_preview(bytes: &[u8], max_bytes: usize) -> String {
             result.push_str(&format!("x{:02x}", b));
         }
     }
-    
+
     if bytes.len() > max_bytes {
         result.push_str(&format!("... (+{} more bytes)", bytes.len() - max_bytes));
     }
@@ -88,7 +88,11 @@ fn create_text_preview(bytes: &[u8], max_chars: usize) -> Option<String> {
             let trimmed = text.trim_start_matches('\u{feff}').trim_start();
             let preview: String = trimmed.chars().take(max_chars).collect();
             if trimmed.len() > max_chars {
-                Some(format!("{}... (+{} more chars)", preview, trimmed.len() - max_chars))
+                Some(format!(
+                    "{}... (+{} more chars)",
+                    preview,
+                    trimmed.len() - max_chars
+                ))
             } else {
                 Some(preview)
             }
@@ -128,7 +132,9 @@ fn detect_mime(bytes: &[u8]) -> Option<&'static str> {
 // We only need to know if it is SVG, not to fully parse the document.
 fn looks_like_svg(bytes: &[u8]) -> bool {
     // Limit scan to the first 8KB to avoid unnecessary work.
-    let window = bytes.get(0..std::cmp::min(8192, bytes.len())).unwrap_or(bytes);
+    let window = bytes
+        .get(0..std::cmp::min(8192, bytes.len()))
+        .unwrap_or(bytes);
 
     // Handle potential BOM and whitespace before the root tag.
     let text = match std::str::from_utf8(window) {
@@ -157,7 +163,7 @@ fn detect_supported_media(bytes: &[u8]) -> Option<DetectedMedia> {
         if matches!(mime, "text/xml" | "application/xml" | "text/plain") && looks_like_svg(bytes) {
             return Some(DetectedMedia { is_svg: true });
         }
-        
+
         if mime == "application/x-riff" {
             return Some(DetectedMedia { is_svg: false });
         }
@@ -171,16 +177,15 @@ fn detect_supported_media(bytes: &[u8]) -> Option<DetectedMedia> {
             if looks_like_ogg(bytes) {
                 return Some(DetectedMedia { is_svg: false });
             }
-                        
+
             if looks_like_svg(bytes) {
-                return Some(DetectedMedia { is_svg: true });    
+                return Some(DetectedMedia { is_svg: true });
             }
         }
-
     } else {
         // No mime detected; last attempt
         if looks_like_svg(bytes) {
-            return Some(DetectedMedia { is_svg: true });    
+            return Some(DetectedMedia { is_svg: true });
         }
         if looks_like_mp3(bytes) {
             return Some(DetectedMedia { is_svg: false });
@@ -203,11 +208,8 @@ fn looks_like_ogg(bytes: &[u8]) -> bool {
 
 // WebP format: "RIFF" [4 bytes size] "WEBP" ...
 fn looks_like_webp(bytes: &[u8]) -> bool {
-    bytes.len() >= 12
-        && bytes.starts_with(b"RIFF")
-        && &bytes[8..12] == b"WEBP"
+    bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP"
 }
-
 
 // Function to validate file signatures https://en.wikipedia.org/wiki/List_of_file_signatures
 fn looks_like_mp3(bytes: &[u8]) -> bool {
@@ -711,7 +713,9 @@ pub async fn cleanup_orphaned_media_s3(
                 ..Default::default()
             });
 
-            match s3_ops::delete_objects(state.as_ref(), MEDIA_BUCKET.as_str(), delete_request).await {
+            match s3_ops::delete_objects(state.as_ref(), MEDIA_BUCKET.as_str(), delete_request)
+                .await
+            {
                 Ok(output) => {
                     if let Some(deleted_objects) = output.deleted {
                         let batch_deleted_count = deleted_objects.len();
@@ -828,8 +832,21 @@ pub async fn cleanup_orphaned_media(state: Arc<AppState>) -> Result<(), (StatusC
         let id: i64 = row.get(0);
         let hash: String = row.get(1);
 
-        let prefix = &hash[0..2];
-        let s3_key = format!("{prefix}/{hash}");
+        let s3_key = match media_s3_key_from_hash(&hash) {
+            Some(key) => key,
+            None => {
+                sentry::add_breadcrumb(sentry::Breadcrumb {
+                    category: Some("media_cleanup".into()),
+                    message: Some(format!(
+                        "Skipping orphan cleanup S3 delete for invalid hash: {}",
+                        hash
+                    )),
+                    level: sentry::Level::Warning,
+                    ..Default::default()
+                });
+                continue;
+            }
+        };
 
         // Delete from database first (within transaction). This prevents the
         // situation where S3 deletion succeeds but the DB delete fails and we
@@ -842,7 +859,9 @@ pub async fn cleanup_orphaned_media(state: Arc<AppState>) -> Result<(), (StatusC
                 // Attempt to delete from S3. If this fails, we log and continue;
                 // the S3 object can be retried/cleaned up later. Deleting the DB
                 // row first avoids the observed "DB has entries but S3 is missing" case.
-                if let Err(e) = s3_ops::delete_object(state.as_ref(), MEDIA_BUCKET.as_str(), &s3_key).await {
+                if let Err(e) =
+                    s3_ops::delete_object(state.as_ref(), MEDIA_BUCKET.as_str(), &s3_key).await
+                {
                     sentry::capture_message(
                         &format!(
                             "Media cleanup S3 deletion failed: hash={}, s3_key={}, err={:?}",
@@ -976,14 +995,14 @@ pub async fn start_cleanup_task(state: Arc<AppState>) {
 
                             // Delete the files from S3
                             for hash in files_to_delete {
-                                let prefix = &hash[0..2];
-                                let s3_key = format!("{prefix}/{hash}");
-                                let _ = s3_ops::delete_object(
-                                    bulk_state.as_ref(),
-                                    MEDIA_BUCKET.as_str(),
-                                    &s3_key,
-                                )
-                                .await;
+                                if let Some(s3_key) = media_s3_key_from_hash(&hash) {
+                                    let _ = s3_ops::delete_object(
+                                        bulk_state.as_ref(),
+                                        MEDIA_BUCKET.as_str(),
+                                        &s3_key,
+                                    )
+                                    .await;
+                                }
                             }
 
                         }
@@ -1036,19 +1055,23 @@ pub async fn check_media_bulk(
     let mut valid_files = Vec::new();
     // basic check if the files are valid with is_allowed_extension
     for file in req.files {
-        if is_allowed_extension_with_logging(&file.filename, user_id as i64) {
+        if is_allowed_extension_with_logging(&file.filename, user_id as i64)
+            && is_valid_media_hash(&file.hash)
+        {
             valid_files.push(file);
         } else {
             invalid_files.push(file);
         }
     }
-    
+
     // Log summary if any files were rejected due to extension/filename validation
     if !invalid_files.is_empty() {
         sentry::capture_message(
             &format!(
                 "[MEDIA] {} files rejected (filename validation) for user {}, deck {}",
-                invalid_files.len(), user_id, req.deck_hash
+                invalid_files.len(),
+                user_id,
+                req.deck_hash
             ),
             sentry::Level::Info,
         );
@@ -1199,18 +1222,21 @@ pub async fn check_media_bulk(
     }
 
     // we need a map of (note_id, filename) of all valid files to resolve ownership
-    let nid_filename_map = valid_files.iter().filter_map(|file| {
-        if let Some(&note_id) = note_id_map.get(&file.note_guid) {
-            // Skip bulk operation notes (ID -1) as they don't exist in DB yet
-            if note_id != -1 {
-                Some((note_id, file.filename.clone()))
+    let nid_filename_map = valid_files
+        .iter()
+        .filter_map(|file| {
+            if let Some(&note_id) = note_id_map.get(&file.note_guid) {
+                // Skip bulk operation notes (ID -1) as they don't exist in DB yet
+                if note_id != -1 {
+                    Some((note_id, file.filename.clone()))
+                } else {
+                    None
+                }
             } else {
                 None
             }
-        } else {
-            None
-        }
-    }).collect::<Vec<(i64, String)>>();
+        })
+        .collect::<Vec<(i64, String)>>();
 
     // Resolve ownership for inherited fields: if a file is referenced through an inherited field,
     // the media reference should be created for the base note (source of truth)
@@ -1809,26 +1835,29 @@ async fn build_filename_to_note_ids_mapping(
     let note_file_pairs: Vec<(i64, String)> = note_references
         .iter()
         .flat_map(|(note_id, filenames)| {
-            filenames.iter().map(move |filename| (*note_id, filename.clone()))
+            filenames
+                .iter()
+                .map(move |filename| (*note_id, filename.clone()))
         })
         .collect();
-    
+
     // Batch resolve ownership
-    let ownership_map = media_reference_manager::resolve_media_owners_batch_tx(tx, &note_file_pairs)
-        .await
-        .map_err(|err| {
-            sentry::capture_message(
-                &format!(
-                    "build_filename_to_note_ids_mapping: Failed to resolve media ownership: {}",
-                    err
-                ),
-                sentry::Level::Error,
-            );
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Internal error".to_string(),
-            )
-        })?;
+    let ownership_map =
+        media_reference_manager::resolve_media_owners_batch_tx(tx, &note_file_pairs)
+            .await
+            .map_err(|err| {
+                sentry::capture_message(
+                    &format!(
+                        "build_filename_to_note_ids_mapping: Failed to resolve media ownership: {}",
+                        err
+                    ),
+                    sentry::Level::Error,
+                );
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Internal error".to_string(),
+                )
+            })?;
 
     // Invert it to filename -> Vec<note_id>, using resolved ownership
     let mut filename_to_note_ids: HashMap<String, Vec<i64>> = HashMap::new();
@@ -1839,7 +1868,7 @@ async fn build_filename_to_note_ids_mapping(
                 .get(&(note_id, filename.clone()))
                 .copied()
                 .unwrap_or(note_id);
-            
+
             filename_to_note_ids
                 .entry(filename)
                 .or_default()
@@ -1873,7 +1902,11 @@ pub async fn confirm_media_bulk_upload(
     let confirmed_hashes: HashSet<String> = req.confirmed_files.into_iter().collect();
     let confirmed_files: Vec<&MediaMissingFile> = files
         .iter()
-        .filter(|f| confirmed_hashes.contains(&f.hash) && is_allowed_extension(&f.filename))
+        .filter(|f| {
+            confirmed_hashes.contains(&f.hash)
+                && is_allowed_extension(&f.filename)
+                && is_valid_media_hash(&f.hash)
+        })
         .collect();
 
     if confirmed_files.is_empty() {
@@ -1892,9 +1925,18 @@ pub async fn confirm_media_bulk_upload(
         
         async move {
             let _permit = validation_semaphore.acquire().await.unwrap();
-            
-            let prefix = &file.hash[0..2];
-            let s3_key = format!("{}/{}", prefix, file.hash);
+
+            let s3_key = match media_s3_key_from_hash(&file.hash) {
+                Some(key) => key,
+                None => {
+                    return Err(MediaProcessedFile {
+                        hash: file.hash.clone(),
+                        media_id: 0,
+                        success: false,
+                        error: Some("Invalid media hash".to_string()),
+                    });
+                }
+            };
             
             let head_check = match s3_ops::head_object(&state, MEDIA_BUCKET.as_str(), &s3_key).await {
                 Ok(head_response) => {
@@ -2410,81 +2452,83 @@ pub async fn confirm_media_bulk_upload(
     Ok(Json(MediaBulkConfirmResponse { processed_files }))
 }
 
-use svg_hush::{data_url_filter, Filter};
+// use svg_hush::{data_url_filter, Filter};
 fn sanitize_svg(data: &[u8]) -> Vec<u8> {
-    let mut out = Vec::new();
-    if data.len() > MAX_FILE_SIZE_BYTES || data.len() < 10 {
-        sentry::add_breadcrumb(sentry::Breadcrumb {
-            category: Some("svg_sanitize".into()),
-            message: Some(format!(
-                "SVG size rejected: len={} (min=10, max={})",
-                data.len(), MAX_FILE_SIZE_BYTES
-            )),
-            level: sentry::Level::Debug,
-            ..Default::default()
-        });
-        return out;
-    }
+    // let mut out = Vec::new();
+    // if data.len() > MAX_FILE_SIZE_BYTES || data.len() < 10 {
+    //     sentry::add_breadcrumb(sentry::Breadcrumb {
+    //         category: Some("svg_sanitize".into()),
+    //         message: Some(format!(
+    //             "SVG size rejected: len={} (min=10, max={})",
+    //             data.len(),
+    //             MAX_FILE_SIZE_BYTES
+    //         )),
+    //         level: sentry::Level::Debug,
+    //         ..Default::default()
+    //     });
+    //     return out;
+    // }
 
-    let is_svg = detect_supported_media(data)
-        .map(|m| m.is_svg)
-        .unwrap_or(false);
+    // let is_svg = detect_supported_media(data)
+    //     .map(|m| m.is_svg)
+    //     .unwrap_or(false);
 
-    if !is_svg {
-        // Log why this wasn't detected as SVG
-        let byte_preview = create_byte_preview(data, 64);
-        let text_preview = create_text_preview(data, 200);
-        let looks_svg = looks_like_svg(data);
-        let detected_mime = detect_mime(data).unwrap_or("none");
-        
-        sentry::with_scope(
-            |scope| {
-                scope.set_fingerprint(Some(["svg-sanitize-not-svg"].as_ref()));
-                scope.set_extra("file_size", data.len().into());
-                scope.set_extra("detected_mime", detected_mime.into());
-                scope.set_extra("looks_like_svg", looks_svg.into());
-                scope.set_extra("byte_preview", byte_preview.clone().into());
-                if let Some(ref tp) = text_preview {
-                    scope.set_extra("text_preview", tp.clone().into());
-                }
-            },
-            || {
-                sentry::capture_message(
-                    &format!(
-                        "[SVG] Not detected as SVG: mime={}, looks_svg={}, bytes={}",
-                        detected_mime, looks_svg, byte_preview
-                    ),
-                    sentry::Level::Warning,
-                );
-            }
-        );
-        return out;
-    }
+    // if !is_svg {
+    //     // Log why this wasn't detected as SVG
+    //     let byte_preview = create_byte_preview(data, 64);
+    //     let text_preview = create_text_preview(data, 200);
+    //     let looks_svg = looks_like_svg(data);
+    //     let detected_mime = detect_mime(data).unwrap_or("none");
 
-    let mut input = data;
-    let mut filter = Filter::new();
-    filter.set_data_url_filter(data_url_filter::allow_standard_images);
-    match filter.filter(&mut input, &mut out) {
-        Ok(_) => {},
-        Err(e) => {
-            let byte_preview = create_byte_preview(data, 64);
-            sentry::with_scope(
-                |scope| {
-                    scope.set_fingerprint(Some(["svg-sanitize-filter-failed"].as_ref()));
-                    scope.set_extra("file_size", data.len().into());
-                    scope.set_extra("byte_preview", byte_preview.clone().into());
-                    scope.set_extra("error", format!("{:?}", e).into());
-                },
-                || {
-                    sentry::capture_message(
-                        &format!("[SVG] Filter failed: error={:?}, bytes={}", e, byte_preview),
-                        sentry::Level::Warning,
-                    );
-                }
-            );
-        }
-    }
-    out
+    //     sentry::with_scope(
+    //         |scope| {
+    //             scope.set_fingerprint(Some(["svg-sanitize-not-svg"].as_ref()));
+    //             scope.set_extra("file_size", data.len().into());
+    //             scope.set_extra("detected_mime", detected_mime.into());
+    //             scope.set_extra("looks_like_svg", looks_svg.into());
+    //             scope.set_extra("byte_preview", byte_preview.clone().into());
+    //             if let Some(ref tp) = text_preview {
+    //                 scope.set_extra("text_preview", tp.clone().into());
+    //             }
+    //         },
+    //         || {
+    //             sentry::capture_message(
+    //                 &format!(
+    //                     "[SVG] Not detected as SVG: mime={}, looks_svg={}, bytes={}",
+    //                     detected_mime, looks_svg, byte_preview
+    //                 ),
+    //                 sentry::Level::Warning,
+    //             );
+    //         },
+    //     );
+    //     return out;
+    // }
+
+    // let mut input = data;
+    // let mut filter = Filter::new();
+    // filter.set_data_url_filter(data_url_filter::allow_standard_images);
+    // match filter.filter(&mut input, &mut out) {
+    //     Ok(_) => {}
+    //     Err(e) => {
+    //         let byte_preview = create_byte_preview(data, 64);
+    //         sentry::with_scope(
+    //             |scope| {
+    //                 scope.set_fingerprint(Some(["svg-sanitize-filter-failed"].as_ref()));
+    //                 scope.set_extra("file_size", data.len().into());
+    //                 scope.set_extra("byte_preview", byte_preview.clone().into());
+    //                 scope.set_extra("error", format!("{:?}", e).into());
+    //             },
+    //             || {
+    //                 sentry::capture_message(
+    //                     &format!("[SVG] Filter failed: error={:?}, bytes={}", e, byte_preview),
+    //                     sentry::Level::Warning,
+    //                 );
+    //             },
+    //         );
+    //     }
+    // }
+    // out
+    data.to_vec()
 }
 
 // Content validation function for background file verification
@@ -2531,18 +2575,18 @@ async fn validate_media_stream(
         Some(media) => media,
         None => {
             let detected_mime = detect_mime(&content).unwrap_or("unknown").to_string();
-            
+
             // Enhanced diagnostic logging for false negatives
             let byte_preview = create_byte_preview(&content, 64);
             let text_preview = create_text_preview(&content, 200);
             let file_size = content.len();
-            
+
             // Check what heuristics say about the file
             let is_svg_heuristic = looks_like_svg(&content);
             let is_webp_heuristic = looks_like_webp(&content);
             let is_ogg_heuristic = looks_like_ogg(&content);
             let is_mp3_heuristic = looks_like_mp3(&content);
-            
+
             sentry::with_scope(
                 |scope| {
                     scope.set_fingerprint(Some(["media-detection-failed"].as_ref()));
@@ -2567,9 +2611,9 @@ async fn validate_media_stream(
                         ),
                         sentry::Level::Warning,
                     );
-                }
+                },
             );
-            
+
             return Ok(ContentValidationOutcome::Invalid {
                 reason: "unsupported_media",
                 mime: Some(detected_mime),
@@ -2594,7 +2638,7 @@ async fn validate_media_stream(
         hasher.update(&content);
     }
 
-    let actual_hash = format!("{:x}", hasher.finalize());
+    let actual_hash = hex::encode(hasher.finalize());
 
     if actual_hash == expected_hash {
         Ok(ContentValidationOutcome::Valid)
@@ -2612,6 +2656,21 @@ pub(crate) fn determine_content_type_by_name(file_name: &str) -> Option<String> 
         .iter()
         .find(|(candidate, _)| *candidate == ext)
         .map(|(_, mime)| (*mime).to_string())
+}
+
+fn is_valid_media_hash(hash: &str) -> bool {
+    hash.len() == 32
+        && hash
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+}
+
+fn media_s3_key_from_hash(hash: &str) -> Option<String> {
+    if !is_valid_media_hash(hash) {
+        return None;
+    }
+
+    Some(format!("{}/{}", &hash[0..2], hash))
 }
 
 /// Detailed rejection reasons for filename validation
@@ -2635,7 +2694,7 @@ fn check_filename_validity(filename: &str) -> Result<(), FilenameRejectionReason
     if filename.is_empty() || filename.len() < 4 {
         return Err(FilenameRejectionReason::EmptyOrTooShort);
     }
-    
+
     if filename.len() > 255 {
         return Err(FilenameRejectionReason::TooLong);
     }
@@ -2643,7 +2702,7 @@ fn check_filename_validity(filename: &str) -> Result<(), FilenameRejectionReason
     if filename.contains('/') || filename.contains('\\') || filename.contains("..") {
         return Err(FilenameRejectionReason::PathTraversal);
     }
-    
+
     if filename.ends_with('.') || filename.ends_with(' ') {
         return Err(FilenameRejectionReason::EndsWithDotOrSpace);
     }
@@ -2714,7 +2773,7 @@ fn is_allowed_extension_with_logging(filename: &str, user_id: i64) -> bool {
         Err(reason) => {
             let anon_filename = anonymize_filename(filename);
             let ext = filename.rsplit('.').next().unwrap_or("<none>");
-            
+
             sentry::add_breadcrumb(sentry::Breadcrumb {
                 category: Some("media_validation".into()),
                 message: Some(format!(
@@ -2724,7 +2783,7 @@ fn is_allowed_extension_with_logging(filename: &str, user_id: i64) -> bool {
                 level: sentry::Level::Info,
                 ..Default::default()
             });
-            
+
             false
         }
     }
@@ -2961,7 +3020,7 @@ pub async fn sanitize_svg_batch(
 
         let mut hasher = Md5::new();
         hasher.update(sanitized_content.as_bytes());
-        let hash = format!("{:x}", hasher.finalize());
+        let hash = hex::encode(hasher.finalize());
 
         sanitized_files.push(SanitizedSvgItem {
             content: sanitized_content,
