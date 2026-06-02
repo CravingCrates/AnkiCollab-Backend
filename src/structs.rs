@@ -184,6 +184,12 @@ pub struct DeckHashOnly {
     pub deck_hash: String,
 }
 
+#[derive(Deserialize)]
+pub struct ReviewNoteRequest {
+    pub deck_hash: String,
+    pub guid: String,
+}
+
 // Media management
 
 #[derive(Debug, Serialize)]

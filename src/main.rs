@@ -148,6 +148,14 @@ fn read_cached_json(file_name: &str) -> Option<String> {
         return None;
     }
 
+    if file_name.contains('/') || file_name.contains('\\') || file_name.contains("..") {
+        eprintln!(
+            "Invalid filename: path separators are not allowed: {}",
+            file_name
+        );
+        return None;
+    }
+
     // Strip .json extension to get the deck hash
     let deck_hash = &file_name[..file_name.len() - 5]; // Remove ".json"
 
@@ -155,8 +163,28 @@ fn read_cached_json(file_name: &str) -> Option<String> {
         return None;
     }
 
-    let path = format!("/home/cached_files/{file_name}");
-    match fs::read_to_string(path) {
+    let base_dir = std::path::Path::new("/home/cached_files");
+    let candidate_path = base_dir.join(file_name);
+
+    let canonical_base = match fs::canonicalize(base_dir) {
+        Ok(path) => path,
+        Err(_) => return None,
+    };
+
+    let canonical_candidate = match fs::canonicalize(&candidate_path) {
+        Ok(path) => path,
+        Err(_) => return None,
+    };
+
+    if !canonical_candidate.starts_with(&canonical_base) {
+        eprintln!(
+            "Rejected cache file read outside base directory: {}",
+            file_name
+        );
+        return None;
+    }
+
+    match fs::read_to_string(canonical_candidate) {
         Ok(data) => Some(data),
         Err(_) => None,
     }
@@ -322,7 +350,7 @@ pub async fn process_card(
             Ok(val) => val,
             Err(_) => {
                 send((
-                    StatusCode::BAD_REQUEST,
+                    StatusCode::INTERNAL_SERVER_ERROR,
                     "Invalid Deck Name".to_string(),
                 ));
                 return;
@@ -936,7 +964,7 @@ pub async fn post_data(
 }
 
 pub async fn request_removal(
-    auth_user: AuthenticatedUser,
+    auth_user: Option<AuthenticatedUser>,
     ClientIp(iip): ClientIp,
     State(db_state): State<Arc<AppState>>,
     Json(form): Json<structs::NoteRemovalReq>,
@@ -956,19 +984,23 @@ pub async fn request_removal(
 
     let ip = iip.to_string();
 
-    let user_id = auth_user.user_id;
+    let authed_user_id = auth_user.map(|u| u.user_id);
 
-    let is_owner_or_maintainer =
-        auth::is_deck_owner_or_maintainer(&db_state, user_id, &info.remote_deck)
-            .await
-            .unwrap_or_default();
+    let is_owner_or_maintainer = match authed_user_id {
+        Some(uid) => {
+            auth::is_deck_owner_or_maintainer(&db_state, uid, &info.remote_deck)
+                .await
+                .unwrap_or_default()
+        }
+        None => false,
+    };
 
     let mut force_overwrite = false;
     if is_owner_or_maintainer {
         force_overwrite = info.force_overwrite;
     }
 
-    let committing_user: Option<i32> = Some(user_id);
+    let committing_user: Option<i32> = authed_user_id;
 
     match note_removal::new(
         &db_state,
@@ -1169,10 +1201,12 @@ pub async fn submit_changelog(
 }
 
 pub async fn check_user_token(
-    _auth_user: AuthenticatedUser,
+    auth_user: Option<AuthenticatedUser>,
     State(_db_state): State<Arc<AppState>>,
-) -> impl IntoResponse { 
-    (StatusCode::OK, serde_json::to_string(&true).unwrap())
+) -> impl IntoResponse {
+    // If the extractor succeeded, the token is valid
+    let res = auth_user.is_some();
+    (StatusCode::OK, serde_json::to_string(&res).unwrap())
 }
 
 pub async fn get_user_hash_from_token(
@@ -1346,6 +1380,85 @@ async fn get_protected_fields_from_deck(
     (StatusCode::OK, serde_json::to_string(&quer).unwrap())
 }
 
+async fn resolve_note_for_review(
+    State(db_state): State<Arc<AppState>>,
+    Json(req): Json<structs::ReviewNoteRequest>,
+) -> impl IntoResponse {
+    if !validate_deck_hash(&req.deck_hash) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Invalid deck hash format".to_string(),
+        )
+            .into_response();
+    }
+
+    let client = match db_state.db_pool.get_owned().await {
+        Ok(pool) => pool,
+        Err(err) => {
+            error::AppError::db_connection("resolve_note_for_review", &err)
+                .with_context("deck_hash", req.deck_hash.clone())
+                .with_context("guid", req.guid.clone())
+                .report_to_sentry();
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal server error".to_string(),
+            )
+                .into_response();
+        }
+    };
+
+    let rows = match client
+        .query(
+            "WITH RECURSIVE deck_tree AS (
+                SELECT id, parent
+                FROM decks
+                WHERE human_hash = $1
+                UNION ALL
+                SELECT d.id, d.parent
+                FROM decks d
+                INNER JOIN deck_tree dt ON dt.id = d.parent
+            )
+            SELECT n.id
+            FROM notes n
+            INNER JOIN deck_tree dt ON n.deck = dt.id
+            WHERE n.deleted = false AND n.guid = $2
+            LIMIT 1",
+            &[&req.deck_hash, &req.guid],
+        )
+        .await
+    {
+        Ok(rows) => rows,
+        Err(err) => {
+            error::AppError::db_query("resolve_note_for_review", &err)
+                .with_context("deck_hash", req.deck_hash.clone())
+                .with_context("guid", req.guid.clone())
+                .report_to_sentry();
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal server error".to_string(),
+            )
+                .into_response();
+        }
+    };
+
+    let note_id: i64 = match rows.first() {
+        Some(row) => row.get(0),
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                "Note not found in this deck".to_string(),
+            )
+                .into_response();
+        }
+    };
+
+    let base_url =
+        std::env::var("WEBSITE_BASE_URL").unwrap_or_else(|_| "https://www.ankicollab.com".to_string());
+    let redirect_url = format!("{base_url}/review/{note_id}");
+
+    axum::response::Redirect::to(&redirect_url).into_response()
+}
+
 fn media_routes() -> Router<Arc<AppState>> {
     let media_api_ratelimit: u32 = std::env::var("MEDIA_API_RATE_LIMIT_PER_MINUTE")
         .expect("MEDIA_API_RATE_LIMIT_PER_MINUTE must be set")
@@ -1384,8 +1497,10 @@ fn media_routes() -> Router<Arc<AppState>> {
     base_router.layer(GovernorLayer::new(media_governor_conf))
 }
 
-async fn get_bucket_size(s3_client: &S3Client, s3_throttle: &S3Throttle, bucket: &str) -> i64 {
-    let mut total_bytes: i64 = 0;
+const DEFAULT_BUCKET_SIZE_BYTES: u64 = 50 * 1024 * 1024 * 1024; // 50 GB
+
+async fn get_bucket_size(s3_client: &S3Client, s3_throttle: &S3Throttle, bucket: &str) -> u64 {
+    let mut total_bytes: u64 = 0;
     let mut continuation_token: Option<String> = None;
 
     loop {
@@ -1406,11 +1521,12 @@ async fn get_bucket_size(s3_client: &S3Client, s3_throttle: &S3Throttle, bucket:
             }
         };
 
-        total_bytes += page
+        let page_bytes = page
             .contents()
             .iter()
-            .map(|obj| obj.size.unwrap_or_default())
-            .sum::<i64>();
+            .map(|obj| u64::try_from(obj.size.unwrap_or_default()).unwrap_or_default())
+            .sum::<u64>();
+        total_bytes = total_bytes.saturating_add(page_bytes);
 
         if page.is_truncated.unwrap_or(false) {
             continuation_token = page.next_continuation_token.clone();
@@ -1432,7 +1548,7 @@ async fn get_bucket_size(s3_client: &S3Client, s3_throttle: &S3Throttle, bucket:
 }
 
 async fn get_all_deck_missing_media(
-    auth_user: AuthenticatedUser,
+    _auth_user: AuthenticatedUser,
     State(state): State<Arc<AppState>>,
     Path(deck_hash): Path<String>,
 ) -> impl IntoResponse {
@@ -1451,10 +1567,10 @@ async fn get_all_deck_missing_media(
         }
     };
 
-    match auth::is_deck_owner_or_maintainer(&state, auth_user.user_id, &deck_hash).await {
-        Ok(true) => {},
-        _ => return (StatusCode::FORBIDDEN, "Not authorized".to_string()),
-    }
+    // match auth::is_deck_owner_or_maintainer(&state, auth_user.user_id, &deck_hash).await {
+    //     Ok(true) => {},
+    //     _ => return (StatusCode::FORBIDDEN, "Not authorized".to_string()),
+    // }
 
     let media_files = media_reference_manager::get_missing_media(&client, &deck_hash)
         .await
@@ -1622,15 +1738,31 @@ async fn main() {
         .await
         .expect("Failed to establish database connection pool");
 
-    // Initialize rate limiter
-    // Get current bucket size of bucket bucket_name
-    let bucket_size = get_bucket_size(&s3_client, s3_throttle.as_ref(), &bucket_name).await;
-
-    let rate_limiter = RateLimiter::new(Arc::new(pool.clone()), bucket_size as u64);
+    // Initialize rate limiter with a safe default so startup is not blocked by S3 listing.
+    println!(
+        "Initializing rate limiter with default bucket size estimate: {} GB",
+        DEFAULT_BUCKET_SIZE_BYTES / 1024 / 1024 / 1024
+    );
+    let rate_limiter = RateLimiter::new(Arc::new(pool.clone()), DEFAULT_BUCKET_SIZE_BYTES);
     rate_limiter
         .load_user_quotas()
         .await
         .expect("Failed to load user quotas");
+
+    let bucket_name_for_refresh = bucket_name.clone();
+    let s3_client_for_refresh = s3_client.clone();
+    let s3_throttle_for_refresh = s3_throttle.clone();
+    let rate_limiter_for_refresh = rate_limiter.clone();
+    tokio::spawn(async move {
+        println!("Starting asynchronous S3 bucket size scan for rate limiter calibration...");
+        let measured_bucket_size = get_bucket_size(
+            &s3_client_for_refresh,
+            s3_throttle_for_refresh.as_ref(),
+            &bucket_name_for_refresh,
+        )
+        .await;
+        rate_limiter_for_refresh.refresh_bucket_size(measured_bucket_size);
+    });
 
     let state = Arc::new(database::AppState {
         db_pool: Arc::new(pool),
@@ -1647,23 +1779,29 @@ async fn main() {
         s3_throttle: s3_throttle.clone(),
     });
 
-    // let is_dry_run = true; // <-- CHANGE TO false TO ENABLE DELETION
-    // println!("Starting cleanup job wrapper...");
-    // match media_manager::cleanup_orphaned_media_s3(state.clone(), is_dry_run).await {
-    //     Ok(deleted_count) => {
-    //         if is_dry_run {
-    //             println!("[DRY RUN] Orphaned media cleanup simulation completed successfully.");
-    //         } else {
-    //             println!("Orphaned media cleanup completed successfully. Deleted {deleted_count} objects.");
-    //         }
-    //     }
-    //     Err(e) => {
-    //         println!("Orphaned media cleanup job failed: {e:?}");
-    //         // Implement alerting or specific failure handling here
-    //         // e.g., send notification to admin, increment metrics counter
-    //     }
-    // }
-    // println!("Cleanup job wrapper finished.");
+    let run_startup_s3_cleanup = false; // <-- CHANGE TO true TO ENABLE STARTUP CLEANUP
+    if run_startup_s3_cleanup {
+        let is_dry_run = true; // <-- CHANGE TO false TO ENABLE DELETION
+        let cleanup_state = state.clone();
+        tokio::spawn(async move {
+            println!("Starting cleanup job wrapper...");
+            match media_manager::cleanup_orphaned_media_s3(cleanup_state, is_dry_run).await {
+                Ok(deleted_count) => {
+                    if is_dry_run {
+                        println!("[DRY RUN] Orphaned media cleanup simulation completed successfully.");
+                    } else {
+                        println!("Orphaned media cleanup completed successfully. Deleted {deleted_count} objects.");
+                    }
+                }
+                Err(e) => {
+                    println!("Orphaned media cleanup job failed: {e:?}");
+                    // Implement alerting or specific failure handling here
+                    // e.g., send notification to admin, increment metrics counter
+                }
+            }
+            println!("Cleanup job wrapper finished.");
+        });
+    }
 
     // IP RAte limiter
     let global_api_ratelimit: u32 = std::env::var("STANDARD_API_RATE_LIMIT_PER_MINUTE")
@@ -1832,6 +1970,7 @@ async fn main() {
             "/GetProtectedFields/{deck_hash}",
             get(get_protected_fields_from_deck),
         )
+        .route("/resolveNoteForReview", post(resolve_note_for_review))
         .nest("/media", media_routes())
         // standard rate limiting - applied to all routes EXCEPT media proxy
         .layer(GovernorLayer::new(global_governor_conf))
@@ -1844,7 +1983,8 @@ async fn main() {
             None => cache_proxy::routes(),
         })
         .with_state(state)
-        .layer(axum::extract::DefaultBodyLimit::max(250 * 1024 * 1024)) // 250 MB default for all routes
+        .layer(axum::extract::DefaultBodyLimit::max(50 * 1024 * 1024)) // 50 MB default for all routes
+        //.layer(axum::extract::DefaultBodyLimit::disable())
         .layer((
             TraceLayer::new_for_http()
                 .on_request(())
