@@ -1,0 +1,181 @@
+map $http_cf_connecting_ip $ip_for_app {
+    default $http_cf_connecting_ip;
+    "" $remote_addr;
+}
+
+map $http_origin $media_upload_cors_origin {
+    default "";
+    "" "";
+    "http://localhost:5555" "http://localhost:5555";
+}
+
+map $http_origin $media_upload_cors_allowed {
+    default 0;
+    "" 1;
+    "http://localhost:5555" 1;
+}
+
+map "$request_method:$media_upload_cors_allowed" $media_upload_handler {
+    default @media_upload_forbidden;
+    ~^PUT:1$ @media_upload_proxy;
+    ~^OPTIONS:1$ @media_upload_preflight;
+}
+
+map $media_upload_cors_allowed $media_upload_cors_origin_header {
+    default "";
+    0 "";
+    1 $media_upload_cors_origin;
+}
+
+server {
+    listen 80;
+    server_name plugin.localhost;
+    client_max_body_size 250m;
+
+    # Security headers
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    add_header Content-Security-Policy "default-src 'none'; frame-ancestors 'none'" always;
+    add_header Permissions-Policy "accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+
+    location / {
+        proxy_pass http://[::1]:5555;
+
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # Always give the app a CF-Connecting-IP value (real client IP when CF present; else $remote_addr)
+        proxy_set_header CF-Connecting-IP  $ip_for_app;
+
+        proxy_connect_timeout 300;
+        proxy_send_timeout    700;
+        proxy_read_timeout    700;
+        send_timeout          700;
+    }
+}
+
+server {
+    listen 80;
+    server_name media.localhost;
+
+    set $s3_host YOUR_S3_HOST; # replace with your actual S3 host
+    set $s3_bucket S3_BUCKET; # replace with your actual bucket name
+
+    client_max_body_size 250m;
+
+    # Security headers
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    add_header Content-Security-Policy "default-src 'none'; frame-ancestors 'none'" always;
+    add_header Permissions-Policy "accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+
+    # Media endpoint - handles both GET (download) and PUT (upload)
+    location ~ "^/v1/media/[0-9a-f]{32}$" {
+
+        # Handle CORS preflight for uploads
+        if ($request_method = 'OPTIONS') {
+            add_header Access-Control-Allow-Origin $media_upload_cors_origin_header always;
+            add_header Access-Control-Allow-Methods "GET, PUT, OPTIONS" always;
+            add_header Access-Control-Allow-Headers "Content-Type, Authorization, X-Requested-With, Content-MD5" always;
+            add_header Content-Length 0;
+            return 204;
+        }
+
+        # Check if upload is allowed (via CORS map)
+        if ($request_method = 'PUT') {
+            set $test "${request_method}:${media_upload_cors_allowed}";
+        }
+        
+        if ($test = 'PUT:0') {
+            return 403;
+        }
+
+        # Proxy to Rust backend for both GET and PUT
+        proxy_pass http://[::1]:5555$request_uri;
+        
+        # Streaming configuration (no buffering)
+        proxy_buffering off;
+        proxy_request_buffering off;
+        
+        # Timeouts
+        proxy_read_timeout 300;
+        proxy_send_timeout 300;
+        proxy_connect_timeout 10;
+
+        # Headers
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header CF-Connecting-IP $ip_for_app;
+        
+        # HTTP version
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        
+        # CORS headers
+        add_header Access-Control-Allow-Origin $media_upload_cors_origin_header always;
+        add_header Access-Control-Allow-Methods "GET, PUT, OPTIONS" always;
+        add_header Access-Control-Allow-Headers "Content-Type, Authorization, X-Requested-With, Content-MD5" always;
+    }
+
+    location = /v1/cache/object {
+        proxy_pass http://[::1]:5555$request_uri;
+        proxy_buffering off;
+        proxy_cache off;
+
+        proxy_read_timeout 600;
+        proxy_send_timeout 600;
+        proxy_connect_timeout 10;
+
+        proxy_next_upstream error timeout invalid_header http_502 http_503 http_504;
+        proxy_next_upstream_tries 2;
+
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header CF-Connecting-IP $ip_for_app;
+
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+
+        add_header Access-Control-Allow-Origin $media_upload_cors_origin_header always;
+        add_header Access-Control-Allow-Methods "GET, OPTIONS" always;
+        add_header Access-Control-Allow-Headers "Content-Type, Authorization, X-Requested-With" always;
+    }
+}
+
+server {
+    listen 80;
+    server_name localhost www.localhost;
+
+    # Security headers
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload" always;
+    add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: http:; font-src 'self' data:; connect-src 'self' http://plugin.localhost http://media.localhost; frame-ancestors 'self'; base-uri 'self'; form-action 'self'" always;
+    add_header Permissions-Policy "accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    add_header Cross-Origin-Opener-Policy "same-origin-allow-popups" always;
+
+    location / {
+        proxy_pass http://[::1]:1337;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header CF-Connecting-IP $ip_for_app;
+
+
+        proxy_connect_timeout 300;
+        proxy_send_timeout    700;
+        proxy_read_timeout    700;
+        send_timeout          700;
+    }
+}
+
