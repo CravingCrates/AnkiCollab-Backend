@@ -2,8 +2,8 @@
 -- PostgreSQL database dump
 --
 
--- Dumped from database version 17.4 (Ubuntu 17.4-1.pgdg24.04+2)
--- Dumped by pg_dump version 17.4 (Ubuntu 17.4-1.pgdg24.04+2)
+-- Dumped from database version 18.3 (Ubuntu 18.3-1.pgdg24.04+1)
+-- Dumped by pg_dump version 18.3 (Ubuntu 18.3-1.pgdg24.04+1)
 
 SET statement_timeout = 0;
 SET lock_timeout = 0;
@@ -34,6 +34,20 @@ ALTER SCHEMA anki OWNER TO postgres;
 
 
 ALTER SCHEMA public OWNER TO postgres;
+
+--
+-- Name: pg_stat_statements; Type: EXTENSION; Schema: -; Owner: -
+--
+
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements WITH SCHEMA anki;
+
+
+--
+-- Name: EXTENSION pg_stat_statements; Type: COMMENT; Schema: -; Owner: 
+--
+
+COMMENT ON EXTENSION pg_stat_statements IS 'track planning and execution statistics of all SQL statements executed';
+
 
 --
 -- Name: delete_deck(text); Type: FUNCTION; Schema: anki; Owner: postgres
@@ -221,7 +235,8 @@ CREATE TABLE anki.card_deletion_suggestions (
     note bigint,
     creator_ip character varying(255) NOT NULL,
     commit integer
-);
+)
+WITH (autovacuum_vacuum_scale_factor='0.01', autovacuum_analyze_scale_factor='0.005');
 
 
 ALTER TABLE anki.card_deletion_suggestions OWNER TO postgres;
@@ -296,49 +311,10 @@ CREATE TABLE anki.commits (
     info character varying(255) DEFAULT ''::character varying,
     user_id integer
 );
+ALTER TABLE ONLY anki.commits ALTER COLUMN deck SET STATISTICS 500;
 
 
 ALTER TABLE anki.commits OWNER TO postgres;
-
---
--- Name: notifications; Type: TABLE; Schema: anki; Owner: postgres
---
-
-CREATE TABLE anki.notifications (
-    id integer NOT NULL,
-    user_id integer NOT NULL,
-    commit_id integer NOT NULL,
-    deck_id bigint NOT NULL,
-    status character varying(32) NOT NULL,
-    reason text,
-    is_read boolean DEFAULT false NOT NULL,
-    created_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT notifications_status_check CHECK (status IN ('approved','denied'))
-);
-
-
-ALTER TABLE anki.notifications OWNER TO postgres;
-
---
--- Name: notifications_id_seq; Type: SEQUENCE; Schema: anki; Owner: postgres
---
-
-CREATE SEQUENCE anki.notifications_id_seq
-    AS integer
-    START WITH 1
-    INCREMENT BY 1
-    NO MINVALUE
-    NO MAXVALUE
-    CACHE 1;
-
-
-ALTER SEQUENCE anki.notifications_id_seq OWNER TO postgres;
-
---
--- Name: notifications_id_seq; Type: SEQUENCE OWNED BY; Schema: anki; Owner: postgres
---
-
-ALTER SEQUENCE anki.notifications_id_seq OWNED BY anki.notifications.id;
 
 --
 -- Name: commits_commit_id_seq; Type: SEQUENCE; Schema: anki; Owner: postgres
@@ -382,8 +358,10 @@ CREATE TABLE anki.decks (
     retention real,
     notes_with_stats_count integer DEFAULT 0,
     restrict_notetypes boolean DEFAULT true,
-    restrict_subdecks boolean DEFAULT false
+    restrict_subdecks boolean DEFAULT false,
+    deleted_at timestamp with time zone
 );
+ALTER TABLE ONLY anki.decks ALTER COLUMN owner SET STATISTICS 500;
 
 
 ALTER TABLE anki.decks OWNER TO postgres;
@@ -401,8 +379,10 @@ CREATE TABLE anki.notes (
     reviewed boolean DEFAULT false NOT NULL,
     creator_ip character varying(255),
     deleted boolean DEFAULT false,
-    anki_id bigint DEFAULT 0
-);
+    anki_id bigint DEFAULT 0,
+    version bigint DEFAULT 0 NOT NULL
+)
+WITH (autovacuum_vacuum_scale_factor='0.01', autovacuum_analyze_scale_factor='0.005');
 
 
 ALTER TABLE anki.notes OWNER TO postgres;
@@ -433,6 +413,7 @@ CREATE MATERIALIZED VIEW anki.deck_stats AS
     d.last_update,
     d.private,
     d.stats_enabled,
+    d.deleted_at,
         CASE
             WHEN (count(n.*) = 0) THEN '0'::text
             WHEN (count(n.*) < 100) THEN '<100'::text
@@ -442,8 +423,8 @@ CREATE MATERIALIZED VIEW anki.deck_stats AS
    FROM ((anki.decks d
      LEFT JOIN deck_tree dt ON ((dt.root_id = d.id)))
      LEFT JOIN anki.notes n ON (((n.deck = dt.id) AND (n.deleted = false))))
-  WHERE (d.parent IS NULL)
-  GROUP BY d.id, d.name, d.description, d.human_hash, d.owner, d.last_update, d.private, d.stats_enabled
+  WHERE ((d.parent IS NULL) AND (d.deleted_at IS NULL))
+  GROUP BY d.id, d.name, d.description, d.human_hash, d.owner, d.last_update, d.private, d.stats_enabled, d.deleted_at
   WITH NO DATA;
 
 
@@ -517,7 +498,8 @@ CREATE TABLE anki.fields (
     reviewed boolean DEFAULT false NOT NULL,
     creator_ip character varying(255),
     commit integer
-);
+)
+WITH (autovacuum_vacuum_scale_factor='0.01', autovacuum_analyze_scale_factor='0.005');
 
 
 ALTER TABLE anki.fields OWNER TO postgres;
@@ -587,6 +569,7 @@ CREATE TABLE anki.maintainers (
     deck bigint,
     user_id integer
 );
+ALTER TABLE ONLY anki.maintainers ALTER COLUMN user_id SET STATISTICS 500;
 
 
 ALTER TABLE anki.maintainers OWNER TO postgres;
@@ -648,7 +631,8 @@ CREATE TABLE anki.media_files (
     hash character varying(64) NOT NULL,
     file_size bigint DEFAULT 0 NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL
-);
+)
+WITH (autovacuum_vacuum_scale_factor='0.01');
 
 
 ALTER TABLE anki.media_files OWNER TO postgres;
@@ -730,7 +714,8 @@ CREATE TABLE anki.media_references (
     media_id bigint NOT NULL,
     note_id bigint,
     file_name character varying(255) NOT NULL
-);
+)
+WITH (autovacuum_vacuum_scale_factor='0.01');
 
 
 ALTER TABLE anki.media_references OWNER TO postgres;
@@ -750,24 +735,30 @@ ALTER TABLE anki.media_references ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTI
 
 
 --
--- Name: mediafolders; Type: TABLE; Schema: anki; Owner: postgres
+-- Name: note_events; Type: TABLE; Schema: anki; Owner: postgres
 --
 
-CREATE TABLE anki.mediafolders (
-    id integer NOT NULL,
-    url character varying(255) NOT NULL,
-    deck bigint NOT NULL
+CREATE TABLE anki.note_events (
+    id bigint NOT NULL,
+    note_id bigint NOT NULL,
+    version bigint NOT NULL,
+    event_type text NOT NULL,
+    actor_user_id integer,
+    commit_id integer,
+    approved boolean,
+    old_value jsonb,
+    new_value jsonb,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
 );
 
 
-ALTER TABLE anki.mediafolders OWNER TO postgres;
+ALTER TABLE anki.note_events OWNER TO postgres;
 
 --
--- Name: mediafolders_id_seq; Type: SEQUENCE; Schema: anki; Owner: postgres
+-- Name: note_events_id_seq; Type: SEQUENCE; Schema: anki; Owner: postgres
 --
 
-CREATE SEQUENCE anki.mediafolders_id_seq
-    AS integer
+CREATE SEQUENCE anki.note_events_id_seq
     START WITH 1
     INCREMENT BY 1
     NO MINVALUE
@@ -775,13 +766,13 @@ CREATE SEQUENCE anki.mediafolders_id_seq
     CACHE 1;
 
 
-ALTER SEQUENCE anki.mediafolders_id_seq OWNER TO postgres;
+ALTER SEQUENCE anki.note_events_id_seq OWNER TO postgres;
 
 --
--- Name: mediafolders_id_seq; Type: SEQUENCE OWNED BY; Schema: anki; Owner: postgres
+-- Name: note_events_id_seq; Type: SEQUENCE OWNED BY; Schema: anki; Owner: postgres
 --
 
-ALTER SEQUENCE anki.mediafolders_id_seq OWNED BY anki.mediafolders.id;
+ALTER SEQUENCE anki.note_events_id_seq OWNED BY anki.note_events.id;
 
 
 --
@@ -870,7 +861,8 @@ CREATE TABLE anki.note_stats (
     retention integer,
     lapses integer,
     reps integer
-);
+)
+WITH (autovacuum_vacuum_scale_factor='0.01', autovacuum_analyze_scale_factor='0.005');
 
 
 ALTER TABLE anki.note_stats OWNER TO postgres;
@@ -1049,6 +1041,47 @@ ALTER SEQUENCE anki.notetype_template_id_seq OWNED BY anki.notetype_template.id;
 
 
 --
+-- Name: notifications; Type: TABLE; Schema: anki; Owner: postgres
+--
+
+CREATE TABLE anki.notifications (
+    id integer NOT NULL,
+    user_id integer NOT NULL,
+    commit_id integer NOT NULL,
+    deck_id bigint NOT NULL,
+    status character varying(32) NOT NULL,
+    reason text,
+    is_read boolean DEFAULT false NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT notifications_status_check CHECK (((status)::text = ANY ((ARRAY['approved'::character varying, 'denied'::character varying])::text[])))
+);
+
+
+ALTER TABLE anki.notifications OWNER TO postgres;
+
+--
+-- Name: notifications_id_seq; Type: SEQUENCE; Schema: anki; Owner: postgres
+--
+
+CREATE SEQUENCE anki.notifications_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER SEQUENCE anki.notifications_id_seq OWNER TO postgres;
+
+--
+-- Name: notifications_id_seq; Type: SEQUENCE OWNED BY; Schema: anki; Owner: postgres
+--
+
+ALTER SEQUENCE anki.notifications_id_seq OWNED BY anki.notifications.id;
+
+
+--
 -- Name: optional_tags; Type: TABLE; Schema: anki; Owner: postgres
 --
 
@@ -1081,42 +1114,6 @@ ALTER SEQUENCE anki.optional_tags_id_seq OWNER TO postgres;
 --
 
 ALTER SEQUENCE anki.optional_tags_id_seq OWNED BY anki.optional_tags.id;
-
-
---
--- Name: service_accounts; Type: TABLE; Schema: anki; Owner: postgres
---
-
-CREATE TABLE anki.service_accounts (
-    id integer NOT NULL,
-    google_data jsonb NOT NULL,
-    folder_id character varying(33) NOT NULL,
-    deck bigint NOT NULL
-);
-
-
-ALTER TABLE anki.service_accounts OWNER TO postgres;
-
---
--- Name: service_accounts_id_seq; Type: SEQUENCE; Schema: anki; Owner: postgres
---
-
-CREATE SEQUENCE anki.service_accounts_id_seq
-    AS integer
-    START WITH 1
-    INCREMENT BY 1
-    NO MINVALUE
-    NO MAXVALUE
-    CACHE 1;
-
-
-ALTER SEQUENCE anki.service_accounts_id_seq OWNER TO postgres;
-
---
--- Name: service_accounts_id_seq; Type: SEQUENCE OWNED BY; Schema: anki; Owner: postgres
---
-
-ALTER SEQUENCE anki.service_accounts_id_seq OWNED BY anki.service_accounts.id;
 
 
 --
@@ -1180,7 +1177,8 @@ CREATE TABLE anki.tags (
     creator_ip character varying(255),
     action boolean DEFAULT true,
     commit integer
-);
+)
+WITH (autovacuum_vacuum_scale_factor='0.01', autovacuum_analyze_scale_factor='0.005');
 
 
 ALTER TABLE anki.tags OWNER TO postgres;
@@ -1230,7 +1228,9 @@ CREATE TABLE public.users (
     username character varying(254) NOT NULL,
     password character varying(255) NOT NULL,
     is_admin boolean DEFAULT false,
-    signup_ip inet NOT NULL
+    signup_ip inet NOT NULL,
+    created_at timestamp without time zone DEFAULT now() NOT NULL,
+    deleted_at timestamp with time zone
 );
 
 
@@ -1280,13 +1280,6 @@ ALTER TABLE ONLY anki.commits ALTER COLUMN commit_id SET DEFAULT nextval('anki.c
 
 
 --
--- Name: notifications id; Type: DEFAULT; Schema: anki; Owner: postgres
---
-
-ALTER TABLE ONLY anki.notifications ALTER COLUMN id SET DEFAULT nextval('anki.notifications_id_seq'::regclass);
-
-
---
 -- Name: deck_subscriptions subscription_id; Type: DEFAULT; Schema: anki; Owner: postgres
 --
 
@@ -1329,10 +1322,10 @@ ALTER TABLE ONLY anki.media ALTER COLUMN id SET DEFAULT nextval('anki.media_id_s
 
 
 --
--- Name: mediafolders id; Type: DEFAULT; Schema: anki; Owner: postgres
+-- Name: note_events id; Type: DEFAULT; Schema: anki; Owner: postgres
 --
 
-ALTER TABLE ONLY anki.mediafolders ALTER COLUMN id SET DEFAULT nextval('anki.mediafolders_id_seq'::regclass);
+ALTER TABLE ONLY anki.note_events ALTER COLUMN id SET DEFAULT nextval('anki.note_events_id_seq'::regclass);
 
 
 --
@@ -1385,17 +1378,17 @@ ALTER TABLE ONLY anki.notetype_template ALTER COLUMN id SET DEFAULT nextval('ank
 
 
 --
+-- Name: notifications id; Type: DEFAULT; Schema: anki; Owner: postgres
+--
+
+ALTER TABLE ONLY anki.notifications ALTER COLUMN id SET DEFAULT nextval('anki.notifications_id_seq'::regclass);
+
+
+--
 -- Name: optional_tags id; Type: DEFAULT; Schema: anki; Owner: postgres
 --
 
 ALTER TABLE ONLY anki.optional_tags ALTER COLUMN id SET DEFAULT nextval('anki.optional_tags_id_seq'::regclass);
-
-
---
--- Name: service_accounts id; Type: DEFAULT; Schema: anki; Owner: postgres
---
-
-ALTER TABLE ONLY anki.service_accounts ALTER COLUMN id SET DEFAULT nextval('anki.service_accounts_id_seq'::regclass);
 
 
 --
@@ -1532,14 +1525,6 @@ ALTER TABLE ONLY anki.notetype_template
 
 
 --
--- Name: notifications notifications_pkey; Type: CONSTRAINT; Schema: anki; Owner: postgres
---
-
-ALTER TABLE ONLY anki.notifications
-    ADD CONSTRAINT notifications_pkey PRIMARY KEY (id);
-
-
---
 -- Name: tags idx_16436_primary; Type: CONSTRAINT; Schema: anki; Owner: postgres
 --
 
@@ -1620,27 +1605,11 @@ ALTER TABLE ONLY anki.media_references
 
 
 --
--- Name: mediafolders mediafolders_pkey; Type: CONSTRAINT; Schema: anki; Owner: postgres
+-- Name: note_events note_events_pkey; Type: CONSTRAINT; Schema: anki; Owner: postgres
 --
 
-ALTER TABLE ONLY anki.mediafolders
-    ADD CONSTRAINT mediafolders_pkey PRIMARY KEY (id);
-
-
---
--- Name: mediafolders mediafolders_unique_deck; Type: CONSTRAINT; Schema: anki; Owner: postgres
---
-
-ALTER TABLE ONLY anki.mediafolders
-    ADD CONSTRAINT mediafolders_unique_deck UNIQUE (deck);
-
-
---
--- Name: mediafolders mediafolders_url_deck_key; Type: CONSTRAINT; Schema: anki; Owner: postgres
---
-
-ALTER TABLE ONLY anki.mediafolders
-    ADD CONSTRAINT mediafolders_url_deck_key UNIQUE (url, deck);
+ALTER TABLE ONLY anki.note_events
+    ADD CONSTRAINT note_events_pkey PRIMARY KEY (id);
 
 
 --
@@ -1668,19 +1637,19 @@ ALTER TABLE ONLY anki.note_move_suggestions
 
 
 --
--- Name: note_stats note_stats_note_id_user_hash_key; Type: CONSTRAINT; Schema: anki; Owner: postgres
---
-
-ALTER TABLE ONLY anki.note_stats
-    ADD CONSTRAINT note_stats_note_id_user_hash_key UNIQUE (note_id, user_hash);
-
-
---
 -- Name: note_stats note_stats_pkey; Type: CONSTRAINT; Schema: anki; Owner: postgres
 --
 
 ALTER TABLE ONLY anki.note_stats
     ADD CONSTRAINT note_stats_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: note_stats note_stats_user_hash_note_id_key; Type: CONSTRAINT; Schema: anki; Owner: postgres
+--
+
+ALTER TABLE ONLY anki.note_stats
+    ADD CONSTRAINT note_stats_user_hash_note_id_key UNIQUE (user_hash, note_id);
 
 
 --
@@ -1692,27 +1661,27 @@ ALTER TABLE ONLY anki.card_deletion_suggestions
 
 
 --
+-- Name: notes notes_deck_guid_unique; Type: CONSTRAINT; Schema: anki; Owner: postgres
+--
+
+ALTER TABLE ONLY anki.notes
+    ADD CONSTRAINT notes_deck_guid_unique UNIQUE (deck, guid);
+
+
+--
+-- Name: notifications notifications_pkey; Type: CONSTRAINT; Schema: anki; Owner: postgres
+--
+
+ALTER TABLE ONLY anki.notifications
+    ADD CONSTRAINT notifications_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: optional_tags optional_tags_pkey; Type: CONSTRAINT; Schema: anki; Owner: postgres
 --
 
 ALTER TABLE ONLY anki.optional_tags
     ADD CONSTRAINT optional_tags_pkey PRIMARY KEY (id);
-
-
---
--- Name: service_accounts service_accounts_deck_key; Type: CONSTRAINT; Schema: anki; Owner: postgres
---
-
-ALTER TABLE ONLY anki.service_accounts
-    ADD CONSTRAINT service_accounts_deck_key UNIQUE (deck);
-
-
---
--- Name: service_accounts service_accounts_pkey; Type: CONSTRAINT; Schema: anki; Owner: postgres
---
-
-ALTER TABLE ONLY anki.service_accounts
-    ADD CONSTRAINT service_accounts_pkey PRIMARY KEY (id);
 
 
 --
@@ -1772,10 +1741,10 @@ ALTER TABLE ONLY public.users
 
 
 --
--- Name: idx_16391_crowdanki_uuid; Type: INDEX; Schema: anki; Owner: postgres
+-- Name: decks_owner_parent_name_uniq; Type: INDEX; Schema: anki; Owner: postgres
 --
 
-CREATE UNIQUE INDEX idx_16391_crowdanki_uuid ON anki.decks USING btree (crowdanki_uuid);
+CREATE UNIQUE INDEX decks_owner_parent_name_uniq ON anki.decks USING btree (owner, parent, name);
 
 
 --
@@ -1828,6 +1797,13 @@ CREATE INDEX idx_commits_deck ON anki.commits USING btree (deck) WHERE (deck IS 
 
 
 --
+-- Name: idx_commits_id_deck; Type: INDEX; Schema: anki; Owner: postgres
+--
+
+CREATE INDEX idx_commits_id_deck ON anki.commits USING btree (commit_id, deck);
+
+
+--
 -- Name: idx_deck_lastupdate; Type: INDEX; Schema: anki; Owner: postgres
 --
 
@@ -1863,10 +1839,31 @@ CREATE UNIQUE INDEX idx_guid_owner ON anki.notetype USING btree (guid, owner);
 
 
 --
+-- Name: idx_media_refs_covering; Type: INDEX; Schema: anki; Owner: postgres
+--
+
+CREATE INDEX idx_media_refs_covering ON anki.media_references USING btree (note_id) INCLUDE (media_id, file_name);
+
+
+--
+-- Name: idx_note_events_note_version_desc; Type: INDEX; Schema: anki; Owner: postgres
+--
+
+CREATE INDEX idx_note_events_note_version_desc ON anki.note_events USING btree (note_id, version DESC);
+
+
+--
 -- Name: idx_note_inheritance_base_note; Type: INDEX; Schema: anki; Owner: postgres
 --
 
 CREATE INDEX idx_note_inheritance_base_note ON anki.note_inheritance USING btree (base_note_id);
+
+
+--
+-- Name: idx_notes_deck_notetype; Type: INDEX; Schema: anki; Owner: postgres
+--
+
+CREATE INDEX idx_notes_deck_notetype ON anki.notes USING btree (deck, notetype);
 
 
 --
@@ -1877,10 +1874,31 @@ CREATE INDEX idx_notes_notetype ON anki.notes USING btree (notetype);
 
 
 --
+-- Name: idx_notes_sync_query; Type: INDEX; Schema: anki; Owner: postgres
+--
+
+CREATE INDEX idx_notes_sync_query ON anki.notes USING btree (deck, id) WHERE ((reviewed = true) AND (deleted = false));
+
+
+--
 -- Name: idx_notetype_field_protected_notetype; Type: INDEX; Schema: anki; Owner: postgres
 --
 
 CREATE INDEX idx_notetype_field_protected_notetype ON anki.notetype_field USING btree (protected, notetype);
+
+
+--
+-- Name: idx_notifications_commit_user; Type: INDEX; Schema: anki; Owner: postgres
+--
+
+CREATE INDEX idx_notifications_commit_user ON anki.notifications USING btree (commit_id, user_id);
+
+
+--
+-- Name: idx_notifications_user_read; Type: INDEX; Schema: anki; Owner: postgres
+--
+
+CREATE INDEX idx_notifications_user_read ON anki.notifications USING btree (user_id, is_read, created_at DESC);
 
 
 --
@@ -1912,17 +1930,17 @@ CREATE INDEX media_deck_idx ON anki.media USING btree (deck);
 
 
 --
--- Name: media_filename_deck_key; Type: INDEX; Schema: anki; Owner: postgres
---
-
-CREATE UNIQUE INDEX media_filename_deck_key ON anki.media USING btree (md5(filename), deck);
-
-
---
 -- Name: media_files_hash_idx; Type: INDEX; Schema: anki; Owner: postgres
 --
 
 CREATE INDEX media_files_hash_idx ON anki.media_files USING btree (hash);
+
+
+--
+-- Name: media_files_id_hash_cover_idx; Type: INDEX; Schema: anki; Owner: postgres
+--
+
+CREATE INDEX media_files_id_hash_cover_idx ON anki.media_files USING btree (id) INCLUDE (hash);
 
 
 --
@@ -1940,24 +1958,31 @@ CREATE INDEX media_references_note_id_idx ON anki.media_references USING btree (
 
 
 --
+-- Name: note_events_commit_idx; Type: INDEX; Schema: anki; Owner: postgres
+--
+
+CREATE INDEX note_events_commit_idx ON anki.note_events USING btree (commit_id);
+
+
+--
+-- Name: note_events_note_created_idx; Type: INDEX; Schema: anki; Owner: postgres
+--
+
+CREATE INDEX note_events_note_created_idx ON anki.note_events USING btree (note_id, created_at DESC);
+
+
+--
+-- Name: note_events_note_version_idx; Type: INDEX; Schema: anki; Owner: postgres
+--
+
+CREATE UNIQUE INDEX note_events_note_version_idx ON anki.note_events USING btree (note_id, version);
+
+
+--
 -- Name: notes_guid_idx; Type: INDEX; Schema: anki; Owner: postgres
 --
 
 CREATE INDEX notes_guid_idx ON anki.notes USING btree (guid);
-
-
---
--- Name: notifications_user_read_idx; Type: INDEX; Schema: anki; Owner: postgres
---
-
-CREATE INDEX notifications_user_read_idx ON anki.notifications USING btree (user_id, is_read, created_at DESC);
-
-
---
--- Name: notifications_commit_user_idx; Type: INDEX; Schema: anki; Owner: postgres
---
-
-CREATE INDEX notifications_commit_user_idx ON anki.notifications USING btree (commit_id, user_id);
 
 
 --
@@ -1968,10 +1993,24 @@ CREATE INDEX subscriptions_deck_id_idx ON anki.subscriptions USING btree (deck_i
 
 
 --
+-- Name: ~calculated_stats-1f6cb044; Type: INDEX; Schema: anki; Owner: postgres
+--
+
+CREATE INDEX "~calculated_stats-1f6cb044" ON anki.calculated_stats USING btree (retention, lapses DESC);
+
+
+--
 -- Name: ~card_deletion_suggestions-baa66cc5; Type: INDEX; Schema: anki; Owner: postgres
 --
 
 CREATE INDEX "~card_deletion_suggestions-baa66cc5" ON anki.card_deletion_suggestions USING btree (commit);
+
+
+--
+-- Name: ~commits-3c37449c; Type: INDEX; Schema: anki; Owner: postgres
+--
+
+CREATE INDEX "~commits-3c37449c" ON anki.commits USING btree (commit_id);
 
 
 --
@@ -1982,6 +2021,20 @@ CREATE INDEX "~decks-f001e354" ON anki.decks USING btree (parent);
 
 
 --
+-- Name: ~fields-7bc3f6ae; Type: INDEX; Schema: anki; Owner: postgres
+--
+
+CREATE INDEX "~fields-7bc3f6ae" ON anki.fields USING btree (note);
+
+
+--
+-- Name: ~fields-baa66cc5; Type: INDEX; Schema: anki; Owner: postgres
+--
+
+CREATE INDEX "~fields-baa66cc5" ON anki.fields USING btree (commit);
+
+
+--
 -- Name: ~maintainers-6d3da866; Type: INDEX; Schema: anki; Owner: postgres
 --
 
@@ -1989,10 +2042,31 @@ CREATE INDEX "~maintainers-6d3da866" ON anki.maintainers USING btree (user_id);
 
 
 --
+-- Name: ~media_references-1a7fc83d; Type: INDEX; Schema: anki; Owner: postgres
+--
+
+CREATE INDEX "~media_references-1a7fc83d" ON anki.media_references USING btree (media_id);
+
+
+--
 -- Name: ~note_move_suggestions-xx; Type: INDEX; Schema: anki; Owner: postgres
 --
 
 CREATE INDEX "~note_move_suggestions-xx" ON anki.note_move_suggestions USING btree (commit);
+
+
+--
+-- Name: ~notes-9fccd81c; Type: INDEX; Schema: anki; Owner: postgres
+--
+
+CREATE INDEX "~notes-9fccd81c" ON anki.notes USING btree (id);
+
+
+--
+-- Name: ~notes-a15a5c5f; Type: INDEX; Schema: anki; Owner: postgres
+--
+
+CREATE INDEX "~notes-a15a5c5f" ON anki.notes USING btree (deck) WHERE (NOT deleted);
 
 
 --
@@ -2007,6 +2081,20 @@ CREATE INDEX "~notes-b609ae4a" ON anki.notes USING btree (deck, last_update) WHE
 --
 
 CREATE INDEX "~notetype-6de94a39" ON anki.notetype USING btree (owner);
+
+
+--
+-- Name: ~tags-baa66cc5; Type: INDEX; Schema: anki; Owner: postgres
+--
+
+CREATE INDEX "~tags-baa66cc5" ON anki.tags USING btree (commit);
+
+
+--
+-- Name: idx_users_deleted_at; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX idx_users_deleted_at ON public.users USING btree (deleted_at) WHERE (deleted_at IS NOT NULL);
 
 
 --
@@ -2161,30 +2249,6 @@ ALTER TABLE ONLY anki.note_inheritance
 
 
 --
--- Name: notifications notifications_commit_fkey; Type: FK CONSTRAINT; Schema: anki; Owner: postgres
---
-
-ALTER TABLE ONLY anki.notifications
-    ADD CONSTRAINT notifications_commit_fkey FOREIGN KEY (commit_id) REFERENCES anki.commits(commit_id) ON DELETE CASCADE;
-
-
---
--- Name: notifications notifications_deck_fkey; Type: FK CONSTRAINT; Schema: anki; Owner: postgres
---
-
-ALTER TABLE ONLY anki.notifications
-    ADD CONSTRAINT notifications_deck_fkey FOREIGN KEY (deck_id) REFERENCES anki.decks(id) ON DELETE CASCADE;
-
-
---
--- Name: notifications notifications_user_fkey; Type: FK CONSTRAINT; Schema: anki; Owner: postgres
---
-
-ALTER TABLE ONLY anki.notifications
-    ADD CONSTRAINT notifications_user_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
-
-
---
 -- Name: login_logs login_logs_user_id_fkey; Type: FK CONSTRAINT; Schema: anki; Owner: postgres
 --
 
@@ -2241,11 +2305,27 @@ ALTER TABLE ONLY anki.media_references
 
 
 --
--- Name: mediafolders mediafolders_deck_fkey; Type: FK CONSTRAINT; Schema: anki; Owner: postgres
+-- Name: note_events note_events_actor_user_id_fkey; Type: FK CONSTRAINT; Schema: anki; Owner: postgres
 --
 
-ALTER TABLE ONLY anki.mediafolders
-    ADD CONSTRAINT mediafolders_deck_fkey FOREIGN KEY (deck) REFERENCES anki.decks(id) ON DELETE CASCADE;
+ALTER TABLE ONLY anki.note_events
+    ADD CONSTRAINT note_events_actor_user_id_fkey FOREIGN KEY (actor_user_id) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: note_events note_events_commit_id_fkey; Type: FK CONSTRAINT; Schema: anki; Owner: postgres
+--
+
+ALTER TABLE ONLY anki.note_events
+    ADD CONSTRAINT note_events_commit_id_fkey FOREIGN KEY (commit_id) REFERENCES anki.commits(commit_id) ON DELETE CASCADE;
+
+
+--
+-- Name: note_events note_events_note_id_fkey; Type: FK CONSTRAINT; Schema: anki; Owner: postgres
+--
+
+ALTER TABLE ONLY anki.note_events
+    ADD CONSTRAINT note_events_note_id_fkey FOREIGN KEY (note_id) REFERENCES anki.notes(id) ON DELETE CASCADE;
 
 
 --
@@ -2329,19 +2409,35 @@ ALTER TABLE ONLY anki.notetype_template
 
 
 --
+-- Name: notifications notifications_commit_fk; Type: FK CONSTRAINT; Schema: anki; Owner: postgres
+--
+
+ALTER TABLE ONLY anki.notifications
+    ADD CONSTRAINT notifications_commit_fk FOREIGN KEY (commit_id) REFERENCES anki.commits(commit_id) ON DELETE CASCADE;
+
+
+--
+-- Name: notifications notifications_deck_fk; Type: FK CONSTRAINT; Schema: anki; Owner: postgres
+--
+
+ALTER TABLE ONLY anki.notifications
+    ADD CONSTRAINT notifications_deck_fk FOREIGN KEY (deck_id) REFERENCES anki.decks(id) ON DELETE CASCADE;
+
+
+--
+-- Name: notifications notifications_user_fk; Type: FK CONSTRAINT; Schema: anki; Owner: postgres
+--
+
+ALTER TABLE ONLY anki.notifications
+    ADD CONSTRAINT notifications_user_fk FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
 -- Name: optional_tags optional_tags_deck_fkey; Type: FK CONSTRAINT; Schema: anki; Owner: postgres
 --
 
 ALTER TABLE ONLY anki.optional_tags
     ADD CONSTRAINT optional_tags_deck_fkey FOREIGN KEY (deck) REFERENCES anki.decks(id) ON DELETE CASCADE;
-
-
---
--- Name: service_accounts service_accounts_deck_fkey; Type: FK CONSTRAINT; Schema: anki; Owner: postgres
---
-
-ALTER TABLE ONLY anki.service_accounts
-    ADD CONSTRAINT service_accounts_deck_fkey FOREIGN KEY (deck) REFERENCES anki.decks(id) ON DELETE CASCADE;
 
 
 --
