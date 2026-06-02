@@ -161,19 +161,23 @@ pub async fn pull_protected_fields(
 ) -> std::result::Result<Vec<NoteModel>, Box<dyn std::error::Error + Send + Sync>> {
     let query = "
     WITH RECURSIVE subdecks AS (
-        SELECT id, human_hash
+        SELECT id
         FROM decks
         WHERE human_hash = $1
         UNION ALL
-        SELECT d.id, d.human_hash 
+        SELECT d.id
         FROM decks d
         JOIN subdecks s ON s.id = d.parent
+    ),
+    filtered_notes AS MATERIALIZED (
+        SELECT DISTINCT n.notetype
+        FROM notes n
+        JOIN subdecks d ON d.id = n.deck
     )
     SELECT DISTINCT nt.id, nt.name, ntf.id, ntf.name, ntf.protected
-    FROM subdecks d
-    JOIN notes n ON n.deck = d.id 
-    JOIN notetype_field ntf ON ntf.protected = true
-    JOIN notetype nt ON nt.id = ntf.notetype AND nt.id = n.notetype    
+    FROM filtered_notes fn
+    JOIN notetype nt ON nt.id = fn.notetype
+    JOIN notetype_field ntf ON ntf.notetype = nt.id AND ntf.protected = true
     ";
     let rows = client.query(query, &[&human_hash]).await?;
 
@@ -244,10 +248,14 @@ pub async fn does_notetype_exist(
 
     for row in check_existing_notetype {
         let existing_stock_kind: Option<i32> = row.get(2);
-        match (notetype.original_stock_kind, existing_stock_kind) {
-            (Some(a), Some(b)) if a != b => continue,
-            (Some(_), None) | (None, Some(_)) => continue,
-            _ => {}
+        // Legacy exports may not include original_stock_kind, so only reject
+        // candidates when both sides explicitly disagree.
+        if notetype
+            .original_stock_kind
+            .zip(existing_stock_kind)
+            .is_some_and(|(a, b)| a != b)
+        {
+            continue;
         }
 
         let existing_notetype_id: i64 = row.get(0);
@@ -304,23 +312,23 @@ pub async fn does_notetype_exist(
 
         // For ProjektAnki Notetypes we allow dirty template matching because those are managed from the notetype addon
         if notetype.name.to_lowercase().contains("projektanki") {
-            let dirty_matching_templates = notetype.tmpls.iter().enumerate().all(|(i, template)| {
-                existing_notetype_templates
-                    .get(i)
-                    .map_or(false, |existing| {
-                        let id_match = template
-                            .id
-                            .zip(existing.get::<_, Option<i64>>(4))
-                            .map_or(false, |(a, b)| a != 0 && b != 0 && a == b);
-                        let name_match = template.name == existing.get::<_, String>(5);
-                        id_match || name_match
-                    })
-            });
+            let dirty_matching_templates =
+                notetype.tmpls.iter().enumerate().all(|(i, template)| {
+                    existing_notetype_templates
+                        .get(i)
+                        .map_or(false, |existing| {
+                            let id_match = template
+                                .id
+                                .zip(existing.get::<_, Option<i64>>(4))
+                                .map_or(false, |(a, b)| a != 0 && b != 0 && a == b);
+                            let name_match = template.name == existing.get::<_, String>(5);
+                            id_match || name_match
+                        })
+                });
             if matching_fields && dirty_matching_templates {
                 return Ok(existing_notetype_guid);
             }
         }
-        
     }
     // Give up
     Ok(String::new())
