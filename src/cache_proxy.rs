@@ -46,7 +46,10 @@ async fn download_cache_object(
                 StatusCode::TOO_MANY_REQUESTS,
                 "Storage busy, please retry".to_string(),
             ),
-            _ => (StatusCode::INTERNAL_SERVER_ERROR, "Internal error".to_string()),
+            _ => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal error".to_string(),
+            ),
         })?;
 
     let content_type = claims
@@ -63,10 +66,7 @@ async fn download_cache_object(
 
     if let Some(length) = content_length {
         if length > 0 {
-            builder = builder.header(
-                axum::http::header::CONTENT_LENGTH,
-                length.to_string(),
-            );
+            builder = builder.header(axum::http::header::CONTENT_LENGTH, length.to_string());
         }
     }
 

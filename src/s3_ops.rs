@@ -1,9 +1,9 @@
 use std::time::Duration;
 
+use crate::s3_throttle::S3Throttle;
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::Delete;
-use crate::s3_throttle::S3Throttle;
 use bytes::Bytes;
 use sentry::Level;
 use tokio::time::sleep;
@@ -149,14 +149,10 @@ pub async fn get_object(
     bucket: &str,
     key: &str,
 ) -> Result<aws_sdk_s3::operation::get_object::GetObjectOutput, S3OpError> {
-    let res = call_with_retry::<_, aws_sdk_s3::operation::get_object::GetObjectError, _, _>(state, || {
-        state
-            .s3_client
-            .get_object()
-            .bucket(bucket)
-            .key(key)
-            .send()
-    })
+    let res = call_with_retry::<_, aws_sdk_s3::operation::get_object::GetObjectError, _, _>(
+        state,
+        || state.s3_client.get_object().bucket(bucket).key(key).send(),
+    )
     .await;
 
     if let Err(ref err) = res {
@@ -171,14 +167,10 @@ pub async fn head_object(
     bucket: &str,
     key: &str,
 ) -> Result<aws_sdk_s3::operation::head_object::HeadObjectOutput, S3OpError> {
-    let res = call_with_retry::<_, aws_sdk_s3::operation::head_object::HeadObjectError, _, _>(state, || {
-        state
-            .s3_client
-            .head_object()
-            .bucket(bucket)
-            .key(key)
-            .send()
-    })
+    let res = call_with_retry::<_, aws_sdk_s3::operation::head_object::HeadObjectError, _, _>(
+        state,
+        || state.s3_client.head_object().bucket(bucket).key(key).send(),
+    )
     .await;
 
     if let Err(ref err) = res {
@@ -195,7 +187,14 @@ pub async fn delete_object(
 ) -> Result<aws_sdk_s3::operation::delete_object::DeleteObjectOutput, S3OpError> {
     let res = call_with_retry::<_, aws_sdk_s3::operation::delete_object::DeleteObjectError, _, _>(
         state,
-        || state.s3_client.delete_object().bucket(bucket).key(key).send(),
+        || {
+            state
+                .s3_client
+                .delete_object()
+                .bucket(bucket)
+                .key(key)
+                .send()
+        },
     )
     .await;
 
@@ -211,18 +210,19 @@ pub async fn delete_objects(
     bucket: &str,
     delete: Delete,
 ) -> Result<aws_sdk_s3::operation::delete_objects::DeleteObjectsOutput, S3OpError> {
-    let res = call_with_retry::<_, aws_sdk_s3::operation::delete_objects::DeleteObjectsError, _, _>(
-        state,
-        || {
-            state
-                .s3_client
-                .delete_objects()
-                .bucket(bucket)
-                .delete(delete.clone())
-                .send()
-        },
-    )
-    .await;
+    let res =
+        call_with_retry::<_, aws_sdk_s3::operation::delete_objects::DeleteObjectsError, _, _>(
+            state,
+            || {
+                state
+                    .s3_client
+                    .delete_objects()
+                    .bucket(bucket)
+                    .delete(delete.clone())
+                    .send()
+            },
+        )
+        .await;
 
     if let Err(ref err) = res {
         log_s3_error("delete_objects", bucket, None, err);
@@ -238,23 +238,24 @@ pub async fn list_objects_v2(
     continuation_token: Option<String>,
     delimiter: Option<String>,
 ) -> Result<aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output, S3OpError> {
-    let res = call_with_retry::<_, aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Error, _, _>(
-        state,
-        || {
-            let mut builder = state.s3_client.list_objects_v2().bucket(bucket);
-            if let Some(p) = prefix.clone() {
-                builder = builder.prefix(p);
-            }
-            if let Some(ct) = continuation_token.clone() {
-                builder = builder.continuation_token(ct);
-            }
-            if let Some(d) = delimiter.clone() {
-                builder = builder.delimiter(d);
-            }
-            builder.send()
-        },
-    )
-    .await;
+    let res =
+        call_with_retry::<_, aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Error, _, _>(
+            state,
+            || {
+                let mut builder = state.s3_client.list_objects_v2().bucket(bucket);
+                if let Some(p) = prefix.clone() {
+                    builder = builder.prefix(p);
+                }
+                if let Some(ct) = continuation_token.clone() {
+                    builder = builder.continuation_token(ct);
+                }
+                if let Some(d) = delimiter.clone() {
+                    builder = builder.delimiter(d);
+                }
+                builder.send()
+            },
+        )
+        .await;
 
     if let Err(ref err) = res {
         log_s3_error("list_objects_v2", bucket, prefix.as_deref(), err);
@@ -271,22 +272,24 @@ pub async fn list_objects_v2_with_client(
     continuation_token: Option<String>,
     delimiter: Option<String>,
 ) -> Result<aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output, S3OpError> {
-    let res = call_with_retry_with_throttle::<_, aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Error, _, _>(
-        s3_throttle,
-        || {
-            let mut builder = s3_client.list_objects_v2().bucket(bucket);
-            if let Some(p) = prefix.clone() {
-                builder = builder.prefix(p);
-            }
-            if let Some(ct) = continuation_token.clone() {
-                builder = builder.continuation_token(ct);
-            }
-            if let Some(d) = delimiter.clone() {
-                builder = builder.delimiter(d);
-            }
-            builder.send()
-        },
-    )
+    let res = call_with_retry_with_throttle::<
+        _,
+        aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Error,
+        _,
+        _,
+    >(s3_throttle, || {
+        let mut builder = s3_client.list_objects_v2().bucket(bucket);
+        if let Some(p) = prefix.clone() {
+            builder = builder.prefix(p);
+        }
+        if let Some(ct) = continuation_token.clone() {
+            builder = builder.continuation_token(ct);
+        }
+        if let Some(d) = delimiter.clone() {
+            builder = builder.delimiter(d);
+        }
+        builder.send()
+    })
     .await;
 
     if let Err(ref err) = res {
@@ -305,18 +308,21 @@ pub async fn put_object(
     content_md5: String,
     body: Bytes,
 ) -> Result<aws_sdk_s3::operation::put_object::PutObjectOutput, S3OpError> {
-    let res = call_with_retry::<_, aws_sdk_s3::operation::put_object::PutObjectError, _, _>(state, || {
-        state
-            .s3_client
-            .put_object()
-            .bucket(bucket)
-            .key(key)
-            .content_length(content_length)
-            .content_type(content_type.clone())
-            .content_md5(content_md5.clone())
-            .body(ByteStream::from(body.clone()))
-            .send()
-    })
+    let res = call_with_retry::<_, aws_sdk_s3::operation::put_object::PutObjectError, _, _>(
+        state,
+        || {
+            state
+                .s3_client
+                .put_object()
+                .bucket(bucket)
+                .key(key)
+                .content_length(content_length)
+                .content_type(content_type.clone())
+                .content_md5(content_md5.clone())
+                .body(ByteStream::from(body.clone()))
+                .send()
+        },
+    )
     .await;
 
     if let Err(ref err) = res {

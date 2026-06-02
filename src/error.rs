@@ -312,7 +312,8 @@ macro_rules! capture_operational {
             $operation,
             "Service temporarily unavailable",
             $msg,
-        ).report_to_sentry()
+        )
+        .report_to_sentry()
     };
 }
 

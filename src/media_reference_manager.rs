@@ -159,14 +159,19 @@ pub async fn resolve_media_owners_batch_tx(
     note_files: &[(i64, String)], // Vec of (note_id, filename)
 ) -> Result<HashMap<(i64, String), i64>, Box<dyn std::error::Error + Send + Sync>> {
     let mut result: HashMap<(i64, String), i64> = HashMap::new();
-    
+
     if note_files.is_empty() {
         return Ok(result);
     }
-    
+
     // Get unique note IDs
-    let note_ids: Vec<i64> = note_files.iter().map(|(id, _)| *id).collect::<HashSet<_>>().into_iter().collect();
-    
+    let note_ids: Vec<i64> = note_files
+        .iter()
+        .map(|(id, _)| *id)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+
     // Batch fetch inheritance info
     let inh_rows = tx
         .query(
@@ -176,7 +181,7 @@ pub async fn resolve_media_owners_batch_tx(
             &[&note_ids],
         )
         .await?;
-    
+
     let mut inheritance_map: HashMap<i64, NoteInheritanceInfo> = HashMap::new();
     for row in inh_rows {
         let subscriber_note_id: i64 = row.get(0);
@@ -190,10 +195,13 @@ pub async fn resolve_media_owners_batch_tx(
             },
         );
     }
-    
+
     // Collect base note IDs we need to query
-    let base_note_ids: Vec<i64> = inheritance_map.values().map(|info| info.base_note_id).collect();
-    
+    let base_note_ids: Vec<i64> = inheritance_map
+        .values()
+        .map(|info| info.base_note_id)
+        .collect();
+
     // Batch fetch base note fields
     let base_fields: HashMap<i64, HashMap<i32, String>> = if !base_note_ids.is_empty() {
         let rows = tx
@@ -202,24 +210,26 @@ pub async fn resolve_media_owners_batch_tx(
                 &[&base_note_ids],
             )
             .await?;
-        
+
         let mut map: HashMap<i64, HashMap<i32, String>> = HashMap::new();
         for row in rows {
             let note_id: i64 = row.get(0);
             let position: u32 = row.get(1);
             let content: String = row.get(2);
-            map.entry(note_id).or_default().insert(position as i32, content);
+            map.entry(note_id)
+                .or_default()
+                .insert(position as i32, content);
         }
         map
     } else {
         HashMap::new()
     };
-    
+
     // Process each (note_id, filename) pair
     for (note_id, filename) in note_files {
         let owner = if let Some(inheritance_info) = inheritance_map.get(note_id) {
             let base_note_id = inheritance_info.base_note_id;
-            
+
             // Check if filename is in inherited fields
             let is_in_inherited = if let Some(fields) = base_fields.get(&base_note_id) {
                 match &inheritance_info.subscribed_fields {
@@ -241,7 +251,7 @@ pub async fn resolve_media_owners_batch_tx(
             } else {
                 false
             };
-            
+
             if is_in_inherited {
                 base_note_id
             } else {
@@ -251,10 +261,10 @@ pub async fn resolve_media_owners_batch_tx(
             // No inheritance
             *note_id
         };
-        
+
         result.insert((*note_id, filename.clone()), owner);
     }
-    
+
     Ok(result)
 }
 
@@ -334,9 +344,12 @@ pub async fn get_missing_media(
 
         // Get inheritance info for this batch
         let inheritance_map = get_inheritance_info_batch(client, &chunk_vec).await?;
-        
+
         // Collect all base note IDs we need to query
-        let base_note_ids: Vec<i64> = inheritance_map.values().map(|info| info.base_note_id).collect();
+        let base_note_ids: Vec<i64> = inheritance_map
+            .values()
+            .map(|info| info.base_note_id)
+            .collect();
 
         // Use JSON aggregation to fetch all fields and references in a single query per batch
         // Now also including the note ID in the result for inheritance lookup
@@ -363,7 +376,7 @@ pub async fn get_missing_media(
                 &[&chunk_vec],
             )
             .await?;
-        
+
         // Also fetch base note media references for inherited notes
         let base_refs_map: HashMap<i64, HashSet<String>> = if !base_note_ids.is_empty() {
             let base_refs_rows = client
@@ -375,7 +388,7 @@ pub async fn get_missing_media(
                     &[&base_note_ids],
                 )
                 .await?;
-            
+
             let mut map = HashMap::new();
             for row in base_refs_rows {
                 let note_id: i64 = row.get(0);
@@ -394,7 +407,7 @@ pub async fn get_missing_media(
         } else {
             HashMap::new()
         };
-        
+
         // Also fetch base note field contents for subscribed field filtering
         let base_fields_map: HashMap<i64, HashMap<i32, String>> = if !base_note_ids.is_empty() {
             let base_fields_rows = client
@@ -404,13 +417,15 @@ pub async fn get_missing_media(
                     &[&base_note_ids],
                 )
                 .await?;
-            
+
             let mut map: HashMap<i64, HashMap<i32, String>> = HashMap::new();
             for row in base_fields_rows {
                 let note_id: i64 = row.get(0);
                 let position: u32 = row.get(1);
                 let content: String = row.get(2);
-                map.entry(note_id).or_default().insert(position as i32, content);
+                map.entry(note_id)
+                    .or_default()
+                    .insert(position as i32, content);
             }
             map
         } else {
@@ -441,7 +456,7 @@ pub async fn get_missing_media(
                         }
                     }
                 }
-                
+
                 // Check if this note inherits from a base note
                 // If so, include the base note's media refs for inherited fields as "existing"
                 if let Some(inheritance_info) = inheritance_map.get(&note_id) {
@@ -453,7 +468,7 @@ pub async fn get_missing_media(
                             if let Some(base_refs) = base_refs_map.get(&base_note_id) {
                                 existing_references.extend(base_refs.iter().cloned());
                             }
-                            
+
                             // Also extract media refs from base note's field contents
                             // since those are the actual inherited field values
                             if let Some(base_fields) = base_fields_map.get(&base_note_id) {
@@ -468,11 +483,12 @@ pub async fn get_missing_media(
                                 let mut inherited_content_refs = HashSet::new();
                                 for pos in subscribed {
                                     if let Some(content) = base_fields.get(pos) {
-                                        inherited_content_refs.extend(extract_media_references(content));
+                                        inherited_content_refs
+                                            .extend(extract_media_references(content));
                                     }
                                 }
                                 // Include base refs that are in subscribed fields' content
-                                
+
                                 if let Some(base_refs) = base_refs_map.get(&base_note_id) {
                                     let relevant_base_refs: HashSet<String> = base_refs
                                         .intersection(&inherited_content_refs)
@@ -480,7 +496,7 @@ pub async fn get_missing_media(
                                         .collect();
                                     existing_references.extend(relevant_base_refs);
                                 }
-                                
+
                                 // Also add to content_references since these are fields that will be shown
                                 content_references.extend(inherited_content_refs);
                             }

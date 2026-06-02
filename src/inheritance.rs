@@ -228,7 +228,7 @@ pub async fn create_note_links(
                 .cloned()
                 .collect();
             println!("GUIDs not found: {:?}", missing_guids);
-            
+
             return Err("Please upload the notes before linking them.".into());
         }
     }
@@ -385,7 +385,7 @@ pub async fn create_note_links(
                     "INSERT INTO anki.note_inheritance (subscriber_note_id, base_note_id, subscribed_fields, removed_base_tags) VALUES ($1, $2, $3, '{}') ON CONFLICT (subscriber_note_id) DO NOTHING",
                     &[sub_id, &base_note_id, &subscribed_fields],
                 ).await?;
-                
+
                 // Remove duplicate locally-reviewed addition tags (action=true, reviewed=true) that also exist on the base note.
                 // We deliberately keep unreviewed suggestions and removals so user intent isn't lost.
                 tx.execute(
@@ -400,8 +400,9 @@ pub async fn create_note_links(
                             tb.reviewed = true AND 
                             tb.action = true
                        )"#,
-                    &[sub_id, &base_note_id]
-                ).await?;
+                    &[sub_id, &base_note_id],
+                )
+                .await?;
 
                 // Remove local field rows that will be inherited (subscribed fields), keeping at least one field row.
                 match &subscribed_fields {
@@ -416,8 +417,9 @@ pub async fn create_note_links(
                             )
                             DELETE FROM fields WHERE note = $1 AND id NOT IN (SELECT id FROM keep)
                             "#,
-                            &[sub_id]
-                        ).await?;
+                            &[sub_id],
+                        )
+                        .await?;
                     }
                     Some(ords) if !ords.is_empty() => {
                         // delete only subscribed positions except always preserve position 0 for safety

@@ -1,7 +1,7 @@
 use std::collections::hash_map::Entry;
 use std::sync::Arc;
 
-use bytes::Bytes;
+use crate::media_tokens::MediaTokenError;
 use axum::{
     body::Body,
     extract::{Path, Query, Request, State},
@@ -13,11 +13,11 @@ use axum::{
 use axum_client_ip::ClientIp;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
+use bytes::Bytes;
 use chrono::Utc;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
-use crate::media_tokens::MediaTokenError;
 
 use crate::database::AppState;
 use crate::media_manager::{determine_content_type_by_name, media_bucket, MAX_FILE_SIZE_BYTES};
@@ -106,10 +106,7 @@ pub(crate) async fn download_media_file(
                 scope.set_tag("security", "replay_attack");
             },
             || {
-                sentry::capture_message(
-                    "Download token replay detected",
-                    sentry::Level::Warning,
-                );
+                sentry::capture_message("Download token replay detected", sentry::Level::Warning);
             },
         );
         return Err(e);
@@ -125,7 +122,10 @@ pub(crate) async fn download_media_file(
                 "Storage rate limit exceeded. Please retry with exponential backoff.".to_string(),
             ),
             S3OpError::NotFound => (StatusCode::NOT_FOUND, "File not found".to_string()),
-            _ => (StatusCode::INTERNAL_SERVER_ERROR, "Failed to retrieve file".to_string()),
+            _ => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to retrieve file".to_string(),
+            ),
         })?;
 
     // Track download for rate limiting

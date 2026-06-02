@@ -53,6 +53,29 @@ pub fn deck_cache_pointer_key(deck_hash: &str) -> String {
     key
 }
 
+fn cache_key_is_scoped_to_deck(deck_hash: &str, key: &str) -> bool {
+    let normalized = key.trim_start_matches('/');
+    if normalized.is_empty() || normalized.contains('\\') {
+        return false;
+    }
+
+    if normalized
+        .split('/')
+        .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+    {
+        return false;
+    }
+
+    let base_prefix = deck_cache_prefix().trim_matches('/');
+    let expected_prefix = if base_prefix.is_empty() {
+        format!("{deck_hash}/")
+    } else {
+        format!("{base_prefix}/{deck_hash}/")
+    };
+
+    normalized.starts_with(&expected_prefix)
+}
+
 pub async fn fetch_cache_bootstrap_response(
     state: &AppState,
     deck_hash: &str,
@@ -75,8 +98,14 @@ pub async fn fetch_cache_bootstrap_response(
     let pointer: crate::structs::LatestPointer = serde_json::from_slice(&body.into_bytes())
         .map_err(|err| format!("failed to parse cache pointer JSON for {deck_hash}: {err}"))?;
 
-    let manifest_key = pointer.manifest_key.clone();
+    let manifest_key = pointer.manifest_key.trim_start_matches('/').to_string();
     let manifest_last_modified = pointer.version_ts.clone();
+
+    if !cache_key_is_scoped_to_deck(deck_hash, &manifest_key) {
+        return Err(format!(
+            "cache pointer manifest key escaped deck scope: deck_hash={deck_hash}; key={manifest_key}"
+        ));
+    }
 
     let manifest_token = state
         .cache_token_service
@@ -101,10 +130,26 @@ pub async fn fetch_cache_bootstrap_response(
                 if let Ok(manifest_json) = serde_json::from_slice::<Value>(&body.into_bytes()) {
                     if let Some(archive_value) = manifest_json.get("archive") {
                         if let Some(archive_obj) = archive_value.as_object() {
-                            archive_key_from_manifest = archive_obj
-                                .get("s3_key")
-                                .and_then(|val| val.as_str())
-                                .map(|val| val.to_string());
+                            if let Some(raw_archive_key) =
+                                archive_obj.get("s3_key").and_then(|val| val.as_str())
+                            {
+                                let normalized_archive_key =
+                                    raw_archive_key.trim_start_matches('/').to_string();
+
+                                if cache_key_is_scoped_to_deck(deck_hash, &normalized_archive_key)
+                                {
+                                    archive_key_from_manifest = Some(normalized_archive_key);
+                                } else {
+                                    sentry::add_breadcrumb(sentry::Breadcrumb {
+                                        category: Some("cache".into()),
+                                        message: Some(format!(
+                                            "manifest archive key escaped deck scope: deck_hash={deck_hash}; key={raw_archive_key}"
+                                        )),
+                                        level: sentry::Level::Warning,
+                                        ..Default::default()
+                                    });
+                                }
+                            }
                         }
                     }
                 }

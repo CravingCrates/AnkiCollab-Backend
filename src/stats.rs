@@ -61,7 +61,10 @@ pub async fn new(
 
     if deck_ids.is_empty() {
         sentry::capture_message(
-            &format!("stats::new: No decks found for deck_id {} (should not happen)", deck_id),
+            &format!(
+                "stats::new: No decks found for deck_id {} (should not happen)",
+                deck_id
+            ),
             sentry::Level::Error,
         );
         return Err(format!("No decks found for deck_id {}", deck_id).into());
@@ -117,7 +120,7 @@ pub async fn new(
 
     // Sort by note_id to ensure consistent lock ordering and avoid deadlocks
     batch_data.sort_by_key(|k| k.0);
-    
+
     // Deduplicate by note_id (keep last occurrence if duplicate GUIDs map to same note)
     batch_data.dedup_by_key(|k| k.0);
 
@@ -128,8 +131,9 @@ pub async fn new(
 
     // Step 1: UPDATE existing rows
     // Lock rows in a consistent order to prevent deadlocks
-    let update_count = tx.execute(
-        "UPDATE note_stats ns
+    let update_count = tx
+        .execute(
+            "UPDATE note_stats ns
          SET retention = tu.retention,
              lapses = tu.lapses,
              reps = tu.reps
@@ -138,9 +142,9 @@ pub async fn new(
              AS t(note_id, retention, lapses, reps)
          ) tu
          WHERE ns.note_id = tu.note_id AND ns.user_hash = $5::varchar",
-        &[&note_ids, &retentions, &lapses, &reps, &user_hash],
-    )
-    .await?;
+            &[&note_ids, &retentions, &lapses, &reps, &user_hash],
+        )
+        .await?;
 
     // Step 2: INSERT new rows (only those that weren't updated)
     // If all rows were updated, skip the insert

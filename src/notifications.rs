@@ -1,12 +1,12 @@
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
-use crate::database::AppState;
 use crate::cleanser;
+use crate::database::AppState;
 use crate::structs::{
     CommitFieldChange, CommitMoveChange, CommitSnapshotEvent, CommitSnapshotResponse,
-    CommitTagChange,
-    NotificationDeckGroup, NotificationHistoryResponse, NotificationItem, NotificationUnreadResponse,
+    CommitTagChange, NotificationDeckGroup, NotificationHistoryResponse, NotificationItem,
+    NotificationUnreadResponse,
 };
 use once_cell::sync::Lazy;
 use serde_json::Value as JsonValue;
@@ -16,8 +16,8 @@ use serde_json::Value as JsonValue;
 static DIFF_SANITIZER: Lazy<ammonia::Builder<'static>> = Lazy::new(|| {
     let mut builder = ammonia::Builder::empty();
     builder.add_tags(&[
-        "ins", "del", "span", "b", "i", "u", "em", "strong", "sub", "sup", "br",
-        "p", "div", "img", "ruby", "rt",
+        "ins", "del", "span", "b", "i", "u", "em", "strong", "sub", "sup", "br", "p", "div", "img",
+        "ruby", "rt",
     ]);
     builder.add_generic_attributes(&["class"]);
     builder.add_tag_attributes("img", &["src", "alt"]);
@@ -91,13 +91,15 @@ pub async fn get_unread_grouped(
             is_read: false,
         };
 
-        let entry = groups.entry(deck_id).or_insert_with(|| NotificationDeckGroup {
-            deck_id,
-            deck_name: deck_display_name(&full_path),
-            approved_count: 0,
-            denied_count: 0,
-            notifications: Vec::new(),
-        });
+        let entry = groups
+            .entry(deck_id)
+            .or_insert_with(|| NotificationDeckGroup {
+                deck_id,
+                deck_name: deck_display_name(&full_path),
+                approved_count: 0,
+                denied_count: 0,
+                notifications: Vec::new(),
+            });
 
         if status == "approved" {
             entry.approved_count += 1;
@@ -190,11 +192,7 @@ pub async fn get_history(
 /// Validated in the handler to return 400; enforced here as defence-in-depth.
 pub const MAX_MARK_READ_IDS: usize = 1_000;
 
-pub async fn mark_read(
-    state: &Arc<AppState>,
-    user_id: i32,
-    ids: &[i32],
-) -> Result<u64, String> {
+pub async fn mark_read(state: &Arc<AppState>, user_id: i32, ids: &[i32]) -> Result<u64, String> {
     if ids.is_empty() {
         return Ok(0);
     }
@@ -371,7 +369,10 @@ pub async fn get_commit_snapshot(
             None
         };
 
-        if event_type == "field_added" || event_type == "field_updated" || event_type == "field_removed" {
+        if event_type == "field_added"
+            || event_type == "field_updated"
+            || event_type == "field_removed"
+        {
             let position = new_value
                 .as_ref()
                 .and_then(extract_position)
@@ -386,7 +387,10 @@ pub async fn get_commit_snapshot(
             });
         }
 
-        if event_type == "tag_added" || event_type == "tag_removed" || event_type == "tag_change_denied" {
+        if event_type == "tag_added"
+            || event_type == "tag_removed"
+            || event_type == "tag_change_denied"
+        {
             let action = if event_type == "tag_removed" {
                 false
             } else if event_type == "tag_change_denied" {
@@ -499,11 +503,16 @@ fn extract_field_content(value: &JsonValue) -> Option<&str> {
         .or_else(|| value.get("value").and_then(|v| v.as_str()))
 }
 
-fn summarize_event_text(event_type: &str, value: &Option<JsonValue>, old_side: bool) -> Option<String> {
+fn summarize_event_text(
+    event_type: &str,
+    value: &Option<JsonValue>,
+    old_side: bool,
+) -> Option<String> {
     let json = value.as_ref()?;
     match event_type {
-        "field_added" | "field_removed" | "field_updated" => extract_field_content(json)
-            .map(|s| cleanser::clean(s)),
+        "field_added" | "field_removed" | "field_updated" => {
+            extract_field_content(json).map(|s| cleanser::clean(s))
+        }
         "tag_added" | "tag_removed" => json
             .get("content")
             .and_then(|v| v.as_str())
