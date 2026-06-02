@@ -27,6 +27,7 @@ pub mod stats;
 pub mod structs;
 pub mod subscription;
 pub mod suggestion;
+pub mod user_ip_key_extractor;
 
 use std::{collections::HashMap, env, io::Read, sync::Arc, time::Duration};
 
@@ -65,8 +66,9 @@ use sha2::{Digest, Sha256};
 use hex::encode;
 
 use tower_governor::{
-    governor::GovernorConfigBuilder, key_extractor::SmartIpKeyExtractor, GovernorLayer,
+    governor::GovernorConfigBuilder, GovernorLayer,
 };
+use crate::user_ip_key_extractor::UserOrIpKeyExtractor;
 
 use aws_sdk_s3::Client as S3Client;
 use media_tokens::MediaTokenService;
@@ -1481,7 +1483,8 @@ fn media_routes() -> Router<Arc<AppState>> {
         GovernorConfigBuilder::default()
             .per_second((f64::from(media_api_ratelimit) / 60.0) as u64)
             .burst_size(media_api_ratelimit / 2)
-            .key_extractor(SmartIpKeyExtractor)
+            .use_headers()
+            .key_extractor(UserOrIpKeyExtractor)
             .finish()
             .unwrap(),
     );
@@ -1804,25 +1807,45 @@ async fn main() {
     }
 
     // IP RAte limiter
-    let global_api_ratelimit: u32 = std::env::var("STANDARD_API_RATE_LIMIT_PER_MINUTE")
+    let standard_api_ratelimit: u32 = std::env::var("STANDARD_API_RATE_LIMIT_PER_MINUTE")
         .expect("STANDARD_API_RATE_LIMIT_PER_MINUTE must be set")
         .parse()
         .expect("Rate limit must be a valid number");
-    let global_governor_conf = Arc::new(
+
+    let strict_api_ratelimit: u32 = std::env::var("STRICT_API_RATE_LIMIT_PER_MINUTE")
+        .expect("STRICT_API_RATE_LIMIT_PER_MINUTE must be set")
+        .parse()
+        .expect("Rate limit must be a valid number");
+    
+    let standard_governor_conf = Arc::new(
         GovernorConfigBuilder::default()
-            .per_second((f64::from(global_api_ratelimit) / 60.0) as u64)
-            .burst_size(global_api_ratelimit / 2)
-            .key_extractor(SmartIpKeyExtractor)
+            .per_second((f64::from(standard_api_ratelimit) / 60.0) as u64)
+            .burst_size(standard_api_ratelimit / 2)
+            .use_headers()
+            .key_extractor(UserOrIpKeyExtractor)
             .finish()
             .unwrap(),
     );
 
-    let governor_limiter = global_governor_conf.limiter().clone();
+    let strict_governor_conf = Arc::new(
+        GovernorConfigBuilder::default()
+            .per_second((f64::from(strict_api_ratelimit) / 60.0) as u64)
+            .burst_size((f64::from(strict_api_ratelimit) / 30.0) as u32)
+            .use_headers()
+            .key_extractor(UserOrIpKeyExtractor)
+            .finish()
+            .unwrap(),
+    );
+    
+    let strict_governor_limiter = strict_governor_conf.limiter().clone();
+    let standard_governor_limiter = standard_governor_conf.limiter().clone();
+
     let interval = Duration::from_secs(60);
     // a separate background task to clean up
     std::thread::spawn(move || loop {
         std::thread::sleep(interval);
-        governor_limiter.retain_recent();
+        strict_governor_limiter.retain_recent();
+        standard_governor_limiter.retain_recent();
     });
 
     // start media cleanup task
@@ -1923,28 +1946,8 @@ async fn main() {
         .with(tracing_subscriber::fmt::layer().without_time())
         .init();
 
-    let media_api_rate_limit_per_minute: u32 = std::env::var("MEDIA_API_RATE_LIMIT_PER_MINUTE")
-        .expect("MEDIA_API_RATE_LIMIT_PER_MINUTE must be set")
-        .parse()
-        .expect("Rate limit must be a valid number");
-    let media_requests_per_second = (f64::from(media_api_rate_limit_per_minute) / 60.0) as u64;
-    let media_burst = media_api_rate_limit_per_minute / 2;
-
-    let media_governor_layer = if media_requests_per_second == 0 {
-        None
-    } else {
-        Some(GovernorLayer::new(Arc::new(
-            GovernorConfigBuilder::default()
-                .per_second(media_requests_per_second)
-                .burst_size(media_burst)
-                .key_extractor(SmartIpKeyExtractor)
-                .finish()
-                .expect("Failed to build media governor config"),
-        )))
-    };
-
     // Build our application with routes
-    let app = Router::new()
+    let basic_routes = Router::new()
         .route("/pullChanges", post(check_for_update))
         .route("/createDeck", post(post_data).layer(axum::extract::DefaultBodyLimit::max(250 * 1024 * 1024))) // 250 MB for deck creation
         .route("/submitCard", post(process_card).layer(axum::extract::DefaultBodyLimit::max(250 * 1024 * 1024))) // 250 MB for card submission
@@ -1955,33 +1958,34 @@ async fn main() {
         .route("/submitChangelog", post(submit_changelog))
         .route("/CreateDeckLink", post(create_deck_link))
         .route("/CreateNewNoteLink", post(create_note_links))
-        .route("/login", post(post_login))
-        .route("/removeToken", post(remove_token))
         .route("/UploadDeckStats", post(upload_deck_stats).layer(axum::extract::DefaultBodyLimit::max(50 * 1024 * 1024))) // 50 MB for stats
         .route("/requestRemoval", post(request_removal))
-        .route("/CheckUserToken", post(check_user_token))
-        .route("/GetUserHashFromToken", post(get_user_hash_from_token))
-        .route("/refreshToken", post(refresh_auth_token))
         .route("/GetNotifications", get(api_get_notifications))
         .route("/GetNotificationsHistory", get(api_get_notifications_history))
         .route("/MarkNotificationsRead", post(api_mark_notifications_read))
         .route("/GetCommitSnapshot/{commit_id}", get(api_get_commit_snapshot))
-        .route(
-            "/GetProtectedFields/{deck_hash}",
-            get(get_protected_fields_from_deck),
-        )
+        .route("/GetProtectedFields/{deck_hash}", get(get_protected_fields_from_deck))
         .route("/resolveNoteForReview", post(resolve_note_for_review))
-        .nest("/media", media_routes())
+        .layer(GovernorLayer::new(standard_governor_conf));
+
+    let auth_routes = Router::new()
+        .route("/login", post(post_login))
+        .route("/removeToken", post(remove_token))
+        .route("/CheckUserToken", post(check_user_token))
+        .route("/GetUserHashFromToken", post(get_user_hash_from_token))
+        .route("/refreshToken", post(refresh_auth_token))
+        .layer(GovernorLayer::new(strict_governor_conf));
+
+    let media_routes = Router::new()
+        .nest("/media", media_routes());
+
+    let app = Router::new()
+        .merge(basic_routes)
+        .merge(auth_routes)
+        .merge(media_routes)
         // standard rate limiting - applied to all routes EXCEPT media proxy
-        .layer(GovernorLayer::new(global_governor_conf))
-        .merge(match &media_governor_layer {
-            Some(layer) => media_proxy::routes().layer(layer.clone()).layer(axum::extract::DefaultBodyLimit::max(12 * 1024 * 1024)), // 12 MB per media file
-            None => media_proxy::routes().layer(axum::extract::DefaultBodyLimit::max(12 * 1024 * 1024)),
-        })
-        .merge(match &media_governor_layer {
-            Some(layer) => cache_proxy::routes().layer(layer.clone()),
-            None => cache_proxy::routes(),
-        })
+        .merge(media_proxy::routes().layer(axum::extract::DefaultBodyLimit::max(20 * 1024 * 1024)))
+        .merge(cache_proxy::routes())
         .with_state(state)
         .layer(axum::extract::DefaultBodyLimit::max(50 * 1024 * 1024)) // 50 MB default for all routes
         //.layer(axum::extract::DefaultBodyLimit::disable())
