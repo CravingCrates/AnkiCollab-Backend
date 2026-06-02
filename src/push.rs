@@ -167,15 +167,18 @@ pub async fn unpack_notes(
             };
 
             if note.fields.is_empty() {
-                return Err(
-                    format!("Error inserting note {}: note has no fields", &note.guid).into(),
-                );
+                continue;
             }
 
             note_guids.push(note.guid.clone());
             note_notetype_guids.push(notetype_guid.clone());
             notes_to_process.push((note, notetype_guid));
             notes_anki_ids.push(note.id);
+        }
+
+        if note_guids.is_empty() {
+            tx.commit().await?;
+            continue;
         }
 
         let inserted_note_rows = tx
@@ -233,7 +236,6 @@ pub async fn unpack_notes(
             };
 
             let mut has_valid_fields = false;
-            let mut has_field_zero = false;
 
             // Stream process fields without storing intermediate vectors
             for (i, field_content) in truncated_fields.iter().enumerate() {
@@ -246,14 +248,11 @@ pub async fn unpack_notes(
                 if !cleaned_content.is_empty() {
                     field_data.push((note_id, i as i32, cleaned_content)); // Store as i32 for PostgreSQL compatibility
                     has_valid_fields = true;
-                    if i == 0 {
-                        has_field_zero = true;
-                    }
                 }
             }
 
-            // A note must have field 0 present to be valid - this is the primary identifier
-            if has_valid_fields && has_field_zero {
+            // Some add-ons intentionally keep field 0 empty. Accept notes with at least one valid field.
+            if has_valid_fields {
                 notes_with_fields.insert(note_id);
             }
 
@@ -282,6 +281,10 @@ pub async fn unpack_notes(
             tx.execute(&delete_notes_stmt, &[&notes_without_fields])
                 .await?;
         }
+
+        // Keep only rows that belong to notes which survived validation.
+        field_data.retain(|(id, _, _)| notes_with_fields.contains(id));
+        tag_data.retain(|(id, _)| notes_with_fields.contains(id));
 
         // Bulk INSERT fields using memory-efficient approach
         if !field_data.is_empty() {
@@ -343,7 +346,7 @@ pub async fn unpack_notes(
         }
 
         if reviewed {
-            let final_note_ids: Vec<i64> = notes_with_fields.into_iter().collect();
+            let final_note_ids: Vec<i64> = notes_with_fields.iter().copied().collect();
 
             if !final_note_ids.is_empty() {
                 // 1) Batch-update all affected notes' timestamps in one statement
@@ -356,8 +359,8 @@ pub async fn unpack_notes(
             }
 
             // Baseline history (single aggregated snapshot per note instead of per-field/tag explosion)
-            if !note_id_map.is_empty() {
-                let inserted_ids: Vec<i64> = note_id_map.values().cloned().collect();
+            if !final_note_ids.is_empty() {
+                let inserted_ids = final_note_ids.clone();
                 // Fetch all fields for inserted notes
                 let field_rows = tx.query(
                     "SELECT note, position, content FROM fields WHERE note = ANY($1) AND reviewed = true ORDER BY note, position",

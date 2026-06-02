@@ -2081,14 +2081,32 @@ pub async fn confirm_media_bulk_upload(
     }
     if validated_files.len() != confirmed_files.len() {
         let failed_count = confirmed_files.len() - validated_files.len();
-        sentry::capture_message(
-            &format!(
-                "confirm_media_bulk_upload: {} of {} files failed validation (batch {})",
-                failed_count,
-                confirmed_files.len(),
-                batch_id_uuid
-            ),
-            sentry::Level::Warning,
+        sentry::with_scope(
+            |_scope| {},
+            || {
+                for failed_file in &processed_files {
+                    sentry::add_breadcrumb(sentry::Breadcrumb {
+                        category: Some("media_validation".into()),
+                        message: Some(format!(
+                            "File failed validation: hash={}, error={}",
+                            failed_file.hash,
+                            failed_file.error.as_deref().unwrap_or("unknown")
+                        )),
+                        level: sentry::Level::Info,
+                        ..Default::default()
+                    });
+                }
+                
+                sentry::capture_message(
+                    &format!(
+                        "confirm_media_bulk_upload: {} of {} files failed validation (batch {})",
+                        failed_count,
+                        confirmed_files.len(),
+                        batch_id_uuid
+                    ),
+                    sentry::Level::Warning,
+                );
+            },
         );
     }
 

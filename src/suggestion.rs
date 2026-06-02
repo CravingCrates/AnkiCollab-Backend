@@ -725,7 +725,7 @@ pub async fn overwrite_note(
     old_deck_id: i64,
     actor_user_id: Option<i32>,
 ) -> std::result::Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    // Validation: prevent wiping a note's content entirely and enforce non-empty field 0
+    // Validation: prevent wiping a note's content entirely
     if note.fields.is_empty() {
         return Err("At least one field is required".into());
     }
@@ -800,10 +800,6 @@ pub async fn overwrite_note(
     {
         let content = cleanser::clean(field);
         if content.trim().is_empty() {
-            // do not allow wiping field 0; ignore instead
-            if i == 0 {
-                continue;
-            }
             tx.execute(&delete_field_q, &[&n_id, &i]).await?;
         } else {
             tx.execute(&upsert_field_q, &[&n_id, &i, &content, &req_ip, &commit])
@@ -959,7 +955,7 @@ pub async fn update_note(
     base_commit_cache: &mut std::collections::HashMap<i64, i32>,
     base_deck_subtrees: &mut std::collections::HashMap<i64, std::collections::HashSet<i64>>,
 ) -> std::result::Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    // Validation: reject updates that would result in empty first field or all-empty payload
+    // Validation: reject updates that would result in all-empty payload
     if note.fields.is_empty() {
         return Err("At least one field is required".into());
     }
@@ -1142,10 +1138,6 @@ pub async fn update_note(
                 .map(|(i, field)| (i as u32, field))
             {
                 let content = cleanser::clean(field);
-                // Ignore suggestions that attempt to set the first field (0) to empty
-                if i == 0 && content.trim().is_empty() {
-                    continue;
-                }
                 if !field.is_empty()
                     || !tx
                         .query(
@@ -1175,7 +1167,6 @@ pub async fn update_note(
                 .await?;
 
             // Check if the field exists, if it does, update it, else insert it. If the new content is empty, don't insert but delete it instead
-            // Field 0 is protected and cannot be deleted - it's the note's primary identifier
             for (i, field) in note
                 .fields
                 .iter()
@@ -1183,10 +1174,6 @@ pub async fn update_note(
                 .map(|(i, field)| (i as u32, field))
             {
                 if field.is_empty() {
-                    // Never delete field 0 - skip silently instead
-                    if i == 0 {
-                        continue;
-                    }
                     tx.execute(&delete_field_q, &[&n_id, &i]).await?;
                 } else {
                     let rows = tx.query(&does_field_exist, &[&n_id, &i]).await?;
