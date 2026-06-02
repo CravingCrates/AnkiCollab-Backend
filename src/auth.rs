@@ -65,6 +65,10 @@ impl FromRequestParts<Arc<database::AppState>> for AuthenticatedUser {
                 "Missing or invalid Authorization header".to_string(),
             ))?;
 
+        if token.is_empty() || token.len() > 1024 {
+            return Err((StatusCode::UNAUTHORIZED, "Malformed token".to_string()));
+        }
+
         let user_id = get_user_from_token(state, token).await.map_err(|_| {
             (
                 StatusCode::UNAUTHORIZED,
@@ -73,10 +77,7 @@ impl FromRequestParts<Arc<database::AppState>> for AuthenticatedUser {
         })?;
 
         if user_id == 0 {
-            return Err((
-                StatusCode::UNAUTHORIZED,
-                "Invalid token".to_string(),
-            ));
+            return Err((StatusCode::UNAUTHORIZED, "Invalid token".to_string()));
         }
 
         Ok(AuthenticatedUser { user_id })
@@ -101,6 +102,10 @@ impl OptionalFromRequestParts<Arc<database::AppState>> for AuthenticatedUser {
             Some(t) => t.to_owned(),
             None => return Ok(None),
         };
+
+        if token.is_empty() || token.len() > 1024 {
+            return Ok(None); // reject safely
+        }
 
         match get_user_from_token(state, &token).await {
             Ok(user_id) if user_id > 0 => Ok(Some(AuthenticatedUser { user_id })),
@@ -507,10 +512,7 @@ pub async fn remove_token_by_user_id(
     let client = db_state.db_pool.get().await?;
 
     let result = client
-        .execute(
-            "DELETE FROM auth_tokens WHERE user_id = $1",
-            &[&user_id],
-        )
+        .execute("DELETE FROM auth_tokens WHERE user_id = $1", &[&user_id])
         .await?;
 
     if result == 0 {
