@@ -134,6 +134,35 @@ impl StorageMonitor {
         self.current_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 
+    /// Refresh baseline usage from a full bucket scan.
+    ///
+    /// This keeps the larger of current in-process tracking and scanned size,
+    /// so we never lose increments recorded while the scan was running.
+    pub fn refresh_from_bucket_scan(&self, scanned_bucket_size: u64) {
+        let previous = self
+            .current_bytes
+            .fetch_max(scanned_bucket_size, Ordering::Relaxed);
+        let effective_bytes = previous.max(scanned_bucket_size);
+
+        let percent_used = (effective_bytes as f64 / self.max_bytes as f64) * 100.0;
+        self.enabled.store(percent_used < 100.0, Ordering::Relaxed);
+
+        let thresholds = [10, 25, 50, 75, 80, 90, 95, 98];
+        let mut last_passed = 0;
+        for threshold in &thresholds {
+            if percent_used >= *threshold as f64 {
+                last_passed = *threshold;
+            }
+        }
+        self.last_logged_percent
+            .store(last_passed, Ordering::Relaxed);
+
+        println!(
+            "Storage monitor baseline refreshed: {effective_bytes}/{} bytes ({percent_used:.1}%)",
+            self.max_bytes
+        );
+    }
+
     /// Get current usage statistics
     #[must_use]
     pub fn get_usage(&self) -> (u64, u64, bool, f64) {
@@ -168,6 +197,12 @@ impl RateLimiter {
         limiter.start_background_tasks();
 
         limiter
+    }
+
+    /// Update the tracked bucket size after an asynchronous full-bucket scan.
+    pub fn refresh_bucket_size(&self, scanned_bucket_size: u64) {
+        self.storage_monitor
+            .refresh_from_bucket_scan(scanned_bucket_size);
     }
 
     // Add method to persist quotas to database
@@ -333,12 +368,16 @@ impl RateLimiter {
                         if let Err(err) = rate_limiter.persist_user_quotas(&mut client).await {
                             sentry::with_scope(
                                 |scope| {
-                                    scope.set_fingerprint(Some(&["rate_limiter", "persist_quotas"]));
+                                    scope
+                                        .set_fingerprint(Some(&["rate_limiter", "persist_quotas"]));
                                     scope.set_tag("operation", "persist_user_quotas");
                                 },
                                 || {
                                     sentry::capture_message(
-                                        &format!("[persist_user_quotas] Failed to persist: {}", err),
+                                        &format!(
+                                            "[persist_user_quotas] Failed to persist: {}",
+                                            err
+                                        ),
                                         sentry::Level::Error,
                                     );
                                 },
@@ -353,7 +392,10 @@ impl RateLimiter {
                             },
                             || {
                                 sentry::capture_message(
-                                    &format!("[persist_user_quotas] Database connection failed: {}", err),
+                                    &format!(
+                                        "[persist_user_quotas] Database connection failed: {}",
+                                        err
+                                    ),
                                     sentry::Level::Error,
                                 );
                             },
