@@ -1,9 +1,19 @@
+// Casts below convert DB/S3 sizes between i64/u64/usize/u32; values are
+// validated and well within range, so the pedantic cast lints are intentional.
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss
+)]
+
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{Delete, ObjectIdentifier};
 use axum::{extract::State, http::StatusCode, Json};
 use axum_client_ip::ClientIp;
 use chrono::{Duration, Utc};
-use std::sync::Arc;
+use std::fmt::Write;
+use std::sync::{Arc, LazyLock};
 use tokio::sync::Semaphore;
 use tokio::time;
 use uuid::Uuid;
@@ -23,10 +33,10 @@ use crate::structs::{
 };
 use crate::{media_reference_manager, AppState};
 
-use lazy_static::lazy_static;
 use std::env::var;
 
 // Helper functions for Sentry privacy and error handling
+#[must_use]
 pub fn anonymize_filename(filename: &str) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
@@ -40,9 +50,9 @@ pub fn anonymize_filename(filename: &str) -> String {
     let hash = hasher.finish();
 
     if extension.is_empty() || extension == filename {
-        format!("file_{:x}", hash)
+        format!("file_{hash:x}")
     } else {
-        format!("file_{:x}.{}", hash, extension)
+        format!("file_{hash:x}.{extension}")
     }
 }
 
@@ -54,7 +64,7 @@ fn create_byte_preview(bytes: &[u8], max_bytes: usize) -> String {
 
     // Create a mixed representation: printable ASCII chars shown as-is, others as hex
     let mut result = String::with_capacity(preview_len * 4);
-    result.push_str("[");
+    result.push('[');
 
     for (i, &b) in preview_bytes.iter().enumerate() {
         if i > 0 {
@@ -69,12 +79,12 @@ fn create_byte_preview(bytes: &[u8], max_bytes: usize) -> String {
         } else if b == b'\t' {
             result.push_str("\\t");
         } else {
-            result.push_str(&format!("x{:02x}", b));
+            let _ = write!(result, "x{b:02x}");
         }
     }
 
     if bytes.len() > max_bytes {
-        result.push_str(&format!("... (+{} more bytes)", bytes.len() - max_bytes));
+        let _ = write!(result, "... (+{} more bytes)", bytes.len() - max_bytes);
     }
     result.push(']');
     result
@@ -263,9 +273,7 @@ fn looks_like_mp3(bytes: &[u8]) -> bool {
 }
 
 // S3 bucket configuration
-lazy_static! {
-    static ref MEDIA_BUCKET: String = var("S3_BUCKET_NAME").unwrap();
-}
+static MEDIA_BUCKET: LazyLock<String> = LazyLock::new(|| var("S3_BUCKET_NAME").unwrap());
 
 pub(crate) fn media_bucket() -> &'static str {
     MEDIA_BUCKET.as_str()
@@ -285,7 +293,7 @@ pub async fn cleanup_orphaned_media_s3(
     let mut db_hashes: HashSet<String> = HashSet::new();
     let conn = state.db_pool.get().await.map_err(|err| {
         sentry::capture_message(
-            &format!("S3 cleanup: Failed to get database connection: {}", err),
+            &format!("S3 cleanup: Failed to get database connection: {err}"),
             sentry::Level::Error,
         );
         (
@@ -304,7 +312,7 @@ pub async fn cleanup_orphaned_media_s3(
         }
         Err(err) => {
             sentry::capture_message(
-                &format!("S3 cleanup: Failed to query media_files table: {}", err),
+                &format!("S3 cleanup: Failed to query media_files table: {err}"),
                 sentry::Level::Error,
             );
             return Err((
@@ -350,8 +358,7 @@ pub async fn cleanup_orphaned_media_s3(
             sentry::add_breadcrumb(sentry::Breadcrumb {
                 category: Some("s3_cleanup".into()),
                 message: Some(format!(
-                    "Failed to query media_bulk_uploads for orphan protection: {}",
-                    err
+                    "Failed to query media_bulk_uploads for orphan protection: {err}"
                 )),
                 level: sentry::Level::Warning,
                 ..Default::default()
@@ -410,8 +417,7 @@ pub async fn cleanup_orphaned_media_s3(
                         sentry::add_breadcrumb(sentry::Breadcrumb {
                             category: Some("s3_cleanup".into()),
                             message: Some(format!(
-                                "Invalid S3 key format (expected 'prefix/hash'): {}",
-                                s3_key
+                                "Invalid S3 key format (expected 'prefix/hash'): {s3_key}"
                             )),
                             level: sentry::Level::Debug,
                             ..Default::default()
@@ -426,19 +432,17 @@ pub async fn cleanup_orphaned_media_s3(
                     if s3_prefix.len() != 2 || !s3_hash.starts_with(s3_prefix) {
                         if s3_prefix == "decks" {
                             continue; // Skip deck prefixes; handled separately below
-                        } else {
-                            sentry::add_breadcrumb(sentry::Breadcrumb {
-                                category: Some("s3_cleanup".into()),
-                                message: Some(format!(
-                                    "S3 key prefix does not match hash start: {}",
-                                    s3_key
-                                )),
-                                level: sentry::Level::Debug,
-                                ..Default::default()
-                            });
-                            prefix_mismatch_count += 1;
-                            continue;
                         }
+                        sentry::add_breadcrumb(sentry::Breadcrumb {
+                            category: Some("s3_cleanup".into()),
+                            message: Some(format!(
+                                "S3 key prefix does not match hash start: {s3_key}"
+                            )),
+                            level: sentry::Level::Debug,
+                            ..Default::default()
+                        });
+                        prefix_mismatch_count += 1;
+                        continue;
                     }
 
                     // Check if the extracted hash exists in our set of DB hashes
@@ -552,8 +556,7 @@ pub async fn cleanup_orphaned_media_s3(
             Err(err) => {
                 sentry::capture_message(
                     &format!(
-                        "S3 cleanup: Failed to query decks table while verifying prefixes: {}",
-                        err
+                        "S3 cleanup: Failed to query decks table while verifying prefixes: {err}"
                     ),
                     sentry::Level::Warning,
                 );
@@ -592,8 +595,7 @@ pub async fn cleanup_orphaned_media_s3(
                             Err(err) => {
                                 sentry::capture_message(
                                     &format!(
-                                        "S3 cleanup: Failed to list objects for orphaned deck prefix {}: {err:?}",
-                                        prefix
+                                        "S3 cleanup: Failed to list objects for orphaned deck prefix {prefix}: {err:?}"
                                     ),
                                     sentry::Level::Warning,
                                 );
@@ -614,8 +616,7 @@ pub async fn cleanup_orphaned_media_s3(
                             if prefix_continuation_token.is_none() {
                                 sentry::capture_message(
                                     &format!(
-                                        "S3 cleanup: Deck object listing truncated without continuation token for prefix {}",
-                                        prefix
+                                        "S3 cleanup: Deck object listing truncated without continuation token for prefix {prefix}"
                                     ),
                                     sentry::Level::Warning,
                                 );
@@ -634,8 +635,7 @@ pub async fn cleanup_orphaned_media_s3(
                 sentry::add_breadcrumb(sentry::Breadcrumb {
                     category: Some("s3_cleanup".into()),
                     message: Some(format!(
-                        "Identified {} orphaned deck prefixes totalling {} objects",
-                        orphaned_deck_prefix_count, orphaned_deck_object_count
+                        "Identified {orphaned_deck_prefix_count} orphaned deck prefixes totalling {orphaned_deck_object_count} objects"
                     )),
                     level: sentry::Level::Info,
                     ..Default::default()
@@ -675,7 +675,7 @@ pub async fn cleanup_orphaned_media_s3(
             orphaned_s3_keys.len(),
             orphaned_deck_prefix_count
         );
-        return Ok(0);
+        Ok(0)
     } else {
         let mut total_deleted_count = 0;
         let mut deletion_had_errors = false;
@@ -722,8 +722,7 @@ pub async fn cleanup_orphaned_media_s3(
                         sentry::add_breadcrumb(sentry::Breadcrumb {
                             category: Some("s3_cleanup".into()),
                             message: Some(format!(
-                                "Successfully deleted batch of {} objects",
-                                batch_deleted_count
+                                "Successfully deleted batch of {batch_deleted_count} objects"
                             )),
                             level: sentry::Level::Info,
                             ..Default::default()
@@ -759,8 +758,7 @@ pub async fn cleanup_orphaned_media_s3(
         sentry::add_breadcrumb(sentry::Breadcrumb {
             category: Some("s3_cleanup".into()),
             message: Some(format!(
-                "Orphan cleanup finished. Total objects deleted: {}",
-                total_deleted_count
+                "Orphan cleanup finished. Total objects deleted: {total_deleted_count}"
             )),
             level: sentry::Level::Info,
             ..Default::default()
@@ -784,7 +782,7 @@ pub async fn cleanup_orphaned_media(state: Arc<AppState>) -> Result<(), (StatusC
 
     let mut db_client = state.db_pool.get().await.map_err(|err| {
         sentry::capture_message(
-            &format!("Media cleanup: Failed to get database connection: {}", err),
+            &format!("Media cleanup: Failed to get database connection: {err}"),
             sentry::Level::Error,
         );
         (
@@ -795,7 +793,7 @@ pub async fn cleanup_orphaned_media(state: Arc<AppState>) -> Result<(), (StatusC
 
     let tx = db_client.transaction().await.map_err(|err| {
         sentry::capture_message(
-            &format!("Media cleanup: Failed to start transaction: {}", err),
+            &format!("Media cleanup: Failed to start transaction: {err}"),
             sentry::Level::Error,
         );
         (
@@ -814,10 +812,7 @@ pub async fn cleanup_orphaned_media(state: Arc<AppState>) -> Result<(), (StatusC
         .await
         .map_err(|err| {
             sentry::capture_message(
-                &format!(
-                    "Media cleanup: Failed to query orphaned media files: {}",
-                    err
-                ),
+                &format!("Media cleanup: Failed to query orphaned media files: {err}"),
                 sentry::Level::Error,
             );
             (
@@ -832,20 +827,18 @@ pub async fn cleanup_orphaned_media(state: Arc<AppState>) -> Result<(), (StatusC
         let id: i64 = row.get(0);
         let hash: String = row.get(1);
 
-        let s3_key = match media_s3_key_from_hash(&hash) {
-            Some(key) => key,
-            None => {
-                sentry::add_breadcrumb(sentry::Breadcrumb {
-                    category: Some("media_cleanup".into()),
-                    message: Some(format!(
-                        "Skipping orphan cleanup S3 delete for invalid hash: {}",
-                        hash
-                    )),
-                    level: sentry::Level::Warning,
-                    ..Default::default()
-                });
-                continue;
-            }
+        let s3_key = if let Some(key) = media_s3_key_from_hash(&hash) {
+            key
+        } else {
+            sentry::add_breadcrumb(sentry::Breadcrumb {
+                category: Some("media_cleanup".into()),
+                message: Some(format!(
+                    "Skipping orphan cleanup S3 delete for invalid hash: {hash}"
+                )),
+                level: sentry::Level::Warning,
+                ..Default::default()
+            });
+            continue;
         };
 
         // Delete from database first (within transaction). This prevents the
@@ -864,8 +857,7 @@ pub async fn cleanup_orphaned_media(state: Arc<AppState>) -> Result<(), (StatusC
                 {
                     sentry::capture_message(
                         &format!(
-                            "Media cleanup S3 deletion failed: hash={}, s3_key={}, err={:?}",
-                            hash, s3_key, e
+                            "Media cleanup S3 deletion failed: hash={hash}, s3_key={s3_key}, err={e:?}"
                         ),
                         sentry::Level::Warning,
                     );
@@ -875,21 +867,19 @@ pub async fn cleanup_orphaned_media(state: Arc<AppState>) -> Result<(), (StatusC
             Err(e) => {
                 sentry::capture_message(
                     &format!(
-                        "Media cleanup: Failed to delete media file {} from database: {}",
-                        hash, e
+                        "Media cleanup: Failed to delete media file {hash} from database: {e}"
                     ),
                     sentry::Level::Error,
                 );
                 // If DB delete fails, do not delete S3 object to avoid ending up
                 // with a missing DB entry and an S3 object that might still be referenced.
-                continue;
             }
         }
     }
 
     tx.commit().await.map_err(|err| {
         sentry::capture_message(
-            &format!("Media cleanup: Failed to commit transaction: {}", err),
+            &format!("Media cleanup: Failed to commit transaction: {err}"),
             sentry::Level::Error,
         );
         (
@@ -903,7 +893,7 @@ pub async fn cleanup_orphaned_media(state: Arc<AppState>) -> Result<(), (StatusC
 }
 
 // Spawn a background task to periodically clean up orphaned media
-pub async fn start_cleanup_task(state: Arc<AppState>) {
+pub fn start_cleanup_task(state: Arc<AppState>) {
     let cleanup_interval = Duration::hours(4).to_std().unwrap();
 
     let orphan_clone = state.clone();
@@ -915,7 +905,7 @@ pub async fn start_cleanup_task(state: Arc<AppState>) {
 
             if let Err(e) = cleanup_orphaned_media(orphan_clone.clone()).await {
                 sentry::capture_message(
-                    &format!("Media cleanup task failed: {:?}", e),
+                    &format!("Media cleanup task failed: {e:?}"),
                     sentry::Level::Error,
                 );
             }
@@ -927,7 +917,7 @@ pub async fn start_cleanup_task(state: Arc<AppState>) {
     // Add bulk upload cleanup
     let bulk_state = state;
     tokio::spawn(async move {
-        let mut interval = time::interval(tokio::time::Duration::from_secs(3600 * 24)); // 24 hour
+        let mut interval = time::interval(tokio::time::Duration::from_hours(24)); // 24 hour
 
         loop {
             interval.tick().await;
@@ -1009,7 +999,7 @@ pub async fn start_cleanup_task(state: Arc<AppState>) {
                     },
                     Err(e) => {
                         sentry::capture_message(
-                            &format!("Bulk upload cleanup: Error cleaning up expired bulk uploads: {}", e),
+                            &format!("Bulk upload cleanup: Error cleaning up expired bulk uploads: {e}"),
                             sentry::Level::Error,
                         );
                     }
@@ -1055,7 +1045,7 @@ pub async fn check_media_bulk(
     let mut valid_files = Vec::new();
     // basic check if the files are valid with is_allowed_extension
     for file in req.files {
-        if is_allowed_extension_with_logging(&file.filename, user_id as i64)
+        if is_allowed_extension_with_logging(&file.filename, i64::from(user_id))
             && is_valid_media_hash(&file.hash)
         {
             valid_files.push(file);
@@ -1080,8 +1070,7 @@ pub async fn check_media_bulk(
     let mut db_client = state.db_pool.get().await.map_err(|err| {
         sentry::capture_message(
             &format!(
-                "check_media_bulk: Failed to get database connection for user {}: {}",
-                user_id, err
+                "check_media_bulk: Failed to get database connection for user {user_id}: {err}"
             ),
             sentry::Level::Error,
         );
@@ -1093,10 +1082,7 @@ pub async fn check_media_bulk(
 
     let tx = db_client.transaction().await.map_err(|err| {
         sentry::capture_message(
-            &format!(
-                "check_media_bulk: Failed to start transaction for user {}: {}",
-                user_id, err
-            ),
+            &format!("check_media_bulk: Failed to start transaction for user {user_id}: {err}"),
             sentry::Level::Error,
         );
         (
@@ -1113,10 +1099,7 @@ pub async fn check_media_bulk(
         .collect();
 
     let bulk_operation_uuid = if let Some(bulk_id_str) = &req.bulk_operation_id {
-        match Uuid::parse_str(bulk_id_str) {
-            Ok(uuid) => Some(uuid),
-            Err(_) => None,
-        }
+        Uuid::parse_str(bulk_id_str).ok()
     } else {
         None
     };
@@ -1187,8 +1170,7 @@ pub async fn check_media_bulk(
         .map_err(|err| {
             sentry::capture_message(
                 &format!(
-                    "check_media_bulk: Failed to query existing media files for user {}: {}",
-                    user_id, err
+                    "check_media_bulk: Failed to query existing media files for user {user_id}: {err}"
                 ),
                 sentry::Level::Error,
             );
@@ -1208,7 +1190,7 @@ pub async fn check_media_bulk(
 
     // Collect note_id and filename pairs for files that already exist and have valid notes
     let mut existing_file_note_pairs: Vec<(i64, String)> = Vec::new();
-    for (hash, _media_id) in &existing_media_ids_map {
+    for hash in existing_media_ids_map.keys() {
         for file in &valid_files {
             if file.hash == *hash {
                 if let Some(&note_id) = note_id_map.get(&file.note_guid) {
@@ -1227,10 +1209,10 @@ pub async fn check_media_bulk(
         .filter_map(|file| {
             if let Some(&note_id) = note_id_map.get(&file.note_guid) {
                 // Skip bulk operation notes (ID -1) as they don't exist in DB yet
-                if note_id != -1 {
-                    Some((note_id, file.filename.clone()))
-                } else {
+                if note_id == -1 {
                     None
+                } else {
+                    Some((note_id, file.filename.clone()))
                 }
             } else {
                 None
@@ -1240,14 +1222,15 @@ pub async fn check_media_bulk(
 
     // Resolve ownership for inherited fields: if a file is referenced through an inherited field,
     // the media reference should be created for the base note (source of truth)
-    let ownership_map = if !nid_filename_map.is_empty() {
+    let ownership_map = if nid_filename_map.is_empty() {
+        HashMap::new()
+    } else {
         media_reference_manager::resolve_media_owners_batch_tx(&tx, &nid_filename_map)
             .await
             .map_err(|err| {
                 sentry::capture_message(
                     &format!(
-                        "check_media_bulk: Failed to resolve media ownership for user {}: {}",
-                        user_id, err
+                        "check_media_bulk: Failed to resolve media ownership for user {user_id}: {err}"
                     ),
                     sentry::Level::Error,
                 );
@@ -1256,8 +1239,6 @@ pub async fn check_media_bulk(
                     "Internal error".to_string(),
                 )
             })?
-    } else {
-        HashMap::new()
     };
 
     // Insert references for existing files using resolved ownership
@@ -1334,8 +1315,7 @@ pub async fn check_media_bulk(
     {
         sentry::capture_message(
             &format!(
-                "User {} exceeded upload quota: {} files, {} bytes",
-                user_id, potential_file_count, total_potential_bytes
+                "User {user_id} exceeded upload quota: {potential_file_count} files, {total_potential_bytes} bytes"
             ),
             sentry::Level::Warning,
         );
@@ -1423,7 +1403,7 @@ pub async fn check_media_bulk(
             let missing_file = MediaMissingFile {
                 hash: file.hash.clone(),
                 filename: file.filename.clone(),
-                note_id: note_id,
+                note_id,
                 file_size: file.file_size, // Store the file size
                 upload_url: None,
             };
@@ -1483,8 +1463,7 @@ pub async fn check_media_bulk(
         let batch_metadata = serde_json::to_value(&missing_files_response).map_err(|err| {
             sentry::capture_message(
                 &format!(
-                    "check_media_bulk: Failed to serialize metadata for user {}: {}",
-                    user_id, err
+                    "check_media_bulk: Failed to serialize metadata for user {user_id}: {err}"
                 ),
                 sentry::Level::Error,
             );
@@ -1503,8 +1482,7 @@ pub async fn check_media_bulk(
         .map_err(|err| {
             sentry::capture_message(
                 &format!(
-                    "check_media_bulk: Failed to store bulk upload metadata for user {}: {}",
-                    user_id, err
+                    "check_media_bulk: Failed to store bulk upload metadata for user {user_id}: {err}"
                 ),
                 sentry::Level::Error,
             );
@@ -1519,10 +1497,7 @@ pub async fn check_media_bulk(
 
     tx.commit().await.map_err(|err| {
         sentry::capture_message(
-            &format!(
-                "check_media_bulk: Failed to commit transaction for user {}: {}",
-                user_id, err
-            ),
+            &format!("check_media_bulk: Failed to commit transaction for user {user_id}: {err}"),
             sentry::Level::Error,
         );
         (
@@ -1568,16 +1543,13 @@ async fn wait_for_bulk_operation_completion(
     })?;
 
     let start_time = std::time::Instant::now();
-    let max_wait_duration = std::time::Duration::from_secs(60);
+    let max_wait_duration = std::time::Duration::from_mins(1);
     let poll_interval = std::time::Duration::from_secs(2);
 
     loop {
         if start_time.elapsed() > max_wait_duration {
             sentry::capture_message(
-                &format!(
-                    "Timeout waiting for note insertion for bulk operation: {}",
-                    bulk_uuid
-                ),
+                &format!("Timeout waiting for note insertion for bulk operation: {bulk_uuid}"),
                 sentry::Level::Warning,
             );
             break;
@@ -1593,7 +1565,7 @@ async fn wait_for_bulk_operation_completion(
             } else {
                 sentry::add_breadcrumb(sentry::Breadcrumb {
                     category: Some("media_upload".into()),
-                    message: Some(format!("Bulk operation not found in cache: {}", bulk_uuid)),
+                    message: Some(format!("Bulk operation not found in cache: {bulk_uuid}")),
                     level: sentry::Level::Warning,
                     ..Default::default()
                 });
@@ -1616,8 +1588,7 @@ async fn retrieve_bulk_upload_metadata(
     let db_client = state.db_pool.get().await.map_err(|err| {
         sentry::capture_message(
             &format!(
-                "retrieve_bulk_upload_metadata: Failed to get database connection for batch {}: {}",
-                batch_id_uuid, err
+                "retrieve_bulk_upload_metadata: Failed to get database connection for batch {batch_id_uuid}: {err}"
             ),
             sentry::Level::Error,
         );
@@ -1637,8 +1608,7 @@ async fn retrieve_bulk_upload_metadata(
         .map_err(|err| {
             sentry::capture_message(
                 &format!(
-                    "retrieve_bulk_upload_metadata: Failed to query metadata for batch {}: {}",
-                    batch_id_uuid, err
+                    "retrieve_bulk_upload_metadata: Failed to query metadata for batch {batch_id_uuid}: {err}"
                 ),
                 sentry::Level::Error,
             );
@@ -1648,27 +1618,25 @@ async fn retrieve_bulk_upload_metadata(
             )
         })?;
 
-    let metadata_json: serde_json::Value = match metadata_row {
-        Some(row) => row.get(0),
-        None => {
-            sentry::add_breadcrumb(sentry::Breadcrumb {
-                category: Some("media_upload".into()),
-                message: Some(format!("Batch not found or expired: {}", batch_id_uuid)),
-                level: sentry::Level::Warning,
-                ..Default::default()
-            });
-            return Err((
-                StatusCode::NOT_FOUND,
-                "Batch not found or expired".to_string(),
-            ));
-        }
+    let metadata_json: serde_json::Value = if let Some(row) = metadata_row {
+        row.get(0)
+    } else {
+        sentry::add_breadcrumb(sentry::Breadcrumb {
+            category: Some("media_upload".into()),
+            message: Some(format!("Batch not found or expired: {batch_id_uuid}")),
+            level: sentry::Level::Warning,
+            ..Default::default()
+        });
+        return Err((
+            StatusCode::NOT_FOUND,
+            "Batch not found or expired".to_string(),
+        ));
     };
 
     serde_json::from_value(metadata_json).map_err(|err| {
         sentry::capture_message(
             &format!(
-                "retrieve_bulk_upload_metadata: Failed to parse metadata for batch {}: {}",
-                batch_id_uuid, err
+                "retrieve_bulk_upload_metadata: Failed to parse metadata for batch {batch_id_uuid}: {err}"
             ),
             sentry::Level::Error,
         );
@@ -1718,7 +1686,7 @@ fn escape_like(s: &str) -> String {
 async fn build_filename_to_note_ids_mapping(
     tx: &tokio_postgres::Transaction<'_>,
     unknown_note_id_files: &[ValidatedFile],
-    deck_hash: &Option<String>,
+    deck_hash: Option<&String>,
     all_note_guids: &[String],
 ) -> Result<HashMap<String, Vec<i64>>, (StatusCode, String)> {
     // Gather all note ids based on the guids and deck hash from database with a recursive query wit the topmost human_hash being the deck_hash
@@ -1743,8 +1711,7 @@ async fn build_filename_to_note_ids_mapping(
         .map_err(|err| {
             sentry::capture_message(
                 &format!(
-                    "build_filename_to_note_ids_mapping: Failed to query notes for deck {:?}: {}",
-                    deck_hash, err
+                    "build_filename_to_note_ids_mapping: Failed to query notes for deck {deck_hash:?}: {err}"
                 ),
                 sentry::Level::Error,
             );
@@ -1787,8 +1754,7 @@ async fn build_filename_to_note_ids_mapping(
                 sentry::add_breadcrumb(sentry::Breadcrumb {
                     category: Some("media_upload".into()),
                     message: Some(format!(
-                        "Error fetching note fields with optimized query, falling back: {}",
-                        e
+                        "Error fetching note fields with optimized query, falling back: {e}"
                     )),
                     level: sentry::Level::Warning,
                     ..Default::default()
@@ -1848,9 +1814,8 @@ async fn build_filename_to_note_ids_mapping(
             .map_err(|err| {
                 sentry::capture_message(
                     &format!(
-                        "build_filename_to_note_ids_mapping: Failed to resolve media ownership: {}",
-                        err
-                    ),
+                "build_filename_to_note_ids_mapping: Failed to resolve media ownership: {err}"
+            ),
                     sentry::Level::Error,
                 );
                 (
@@ -1883,6 +1848,8 @@ pub async fn confirm_media_bulk_upload(
     state: Arc<AppState>,
     req: MediaBulkConfirmRequest,
 ) -> Result<Json<MediaBulkConfirmResponse>, (StatusCode, String)> {
+    const VALIDATION_CONCURRENCY: usize = 32;
+
     if req.confirmed_files.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "Invalid Format".to_string()));
     }
@@ -1914,7 +1881,6 @@ pub async fn confirm_media_bulk_upload(
             processed_files: vec![],
         }));
     }
-    const VALIDATION_CONCURRENCY: usize = 32;
 
     let validation_semaphore = Arc::new(Semaphore::new(VALIDATION_CONCURRENCY));
 
@@ -1922,7 +1888,7 @@ pub async fn confirm_media_bulk_upload(
         let validation_semaphore = validation_semaphore.clone();
         let state = state.clone();
         let file = *file;
-        
+
         async move {
             let _permit = validation_semaphore.acquire().await.unwrap();
 
@@ -1937,19 +1903,20 @@ pub async fn confirm_media_bulk_upload(
                     });
                 }
             };
-            
+
             let head_check = match s3_ops::head_object(&state, MEDIA_BUCKET.as_str(), &s3_key).await {
                 Ok(head_response) => {
                     let actual_size = head_response.content_length.unwrap_or(0);
                     let actual_size_f64 = actual_size as f64;
                     let file_size_f64 = file.file_size as f64;
-                    
+
                     // Validate file size (within 1% tolerance)
-                    if actual_size > MAX_FILE_SIZE_BYTES as i64 
+                    let size_invalid = actual_size > MAX_FILE_SIZE_BYTES as i64
                         || actual_size == 0
-                        || (actual_size_f64 > file_size_f64 * 1.01)
-                        || (actual_size_f64 < file_size_f64 * 0.99)
-                    {
+                        || actual_size_f64 > file_size_f64 * 1.01
+                        || actual_size_f64 < file_size_f64 * 0.99;
+
+                    if size_invalid {
                         Some("File size mismatch or invalid".to_string())
                     } else {
                         None // Size is valid, proceed to content validation
@@ -1959,12 +1926,12 @@ pub async fn confirm_media_bulk_upload(
                     Some("File not found in storage".to_string())
                 }
             };
-            
+
             // If head check failed, skip content download
             if let Some(error_msg) = head_check {
                 // Delete invalid file from S3
                 let _ = s3_ops::delete_object(&state, MEDIA_BUCKET.as_str(), &s3_key).await;
-                
+
                 return Err(MediaProcessedFile {
                     hash: file.hash.clone(),
                     media_id: 0,
@@ -1972,7 +1939,7 @@ pub async fn confirm_media_bulk_upload(
                     error: Some(error_msg),
                 });
             }
-            
+
             // Head check passed, now download and validate file content
             let validation_result = match s3_ops::get_object(&state, MEDIA_BUCKET.as_str(), &s3_key).await {
                 Ok(output) => {
@@ -2011,7 +1978,7 @@ pub async fn confirm_media_bulk_upload(
                                     );
                                 }
                             );
-                            Err(format!("File content validation failed ({})", reason))
+                            Err(format!("File content validation failed ({reason})"))
                         }
                         Err(e) => {
                             let anon_filename = anonymize_filename(&file.filename);
@@ -2022,7 +1989,7 @@ pub async fn confirm_media_bulk_upload(
                                     scope.set_extra("hash", file.hash.clone().into());
                                     scope.set_extra("filename_anon", anon_filename.clone().into());
                                     scope.set_extra("file_extension", file.filename.rsplit('.').next().unwrap_or("").into());
-                                    scope.set_extra("error_details", format!("{:?}", e).into());
+                                    scope.set_extra("error_details", format!("{e:?}").into());
                                     scope.set_tag("validation_type", "processing_error");
                                 },
                                 || {
@@ -2037,20 +2004,20 @@ pub async fn confirm_media_bulk_upload(
                                     );
                                 }
                             );
-                            Err(format!("Validation error: {}", e))
+                            Err(format!("Validation error: {e}"))
                         }
                     }
                 }
                 Err(_) => Err("File not found in storage".to_string()),
             };
-            
+
             // If validation failed, delete from S3 and return error
             match validation_result {
                 Ok(validated_file) => Ok(validated_file),
                 Err(error_msg) => {
                     // Delete invalid file from S3
                     let _ = s3_ops::delete_object(&state, MEDIA_BUCKET.as_str(), &s3_key).await;
-                    
+
                     Err(MediaProcessedFile {
                         hash: file.hash.clone(),
                         media_id: 0,
@@ -2096,7 +2063,7 @@ pub async fn confirm_media_bulk_upload(
                         ..Default::default()
                     });
                 }
-                
+
                 sentry::capture_message(
                     &format!(
                         "confirm_media_bulk_upload: {} of {} files failed validation (batch {})",
@@ -2118,8 +2085,7 @@ pub async fn confirm_media_bulk_upload(
     let mut db_client = state.db_pool.get().await.map_err(|err| {
         sentry::capture_message(
             &format!(
-                "confirm_media_bulk_upload: Failed to get database connection for batch {}: {}",
-                batch_id_uuid, err
+                "confirm_media_bulk_upload: Failed to get database connection for batch {batch_id_uuid}: {err}"
             ),
             sentry::Level::Error,
         );
@@ -2132,8 +2098,7 @@ pub async fn confirm_media_bulk_upload(
     let tx = db_client.transaction().await.map_err(|err| {
         sentry::capture_message(
             &format!(
-                "confirm_media_bulk_upload: Failed to start transaction for batch {}: {}",
-                batch_id_uuid, err
+                "confirm_media_bulk_upload: Failed to start transaction for batch {batch_id_uuid}: {err}"
             ),
             sentry::Level::Error,
         );
@@ -2307,7 +2272,7 @@ pub async fn confirm_media_bulk_upload(
                     filename: f.filename.clone(),
                 })
                 .collect::<Vec<_>>(),
-            &deck_hash,
+            deck_hash.as_ref(),
             &all_note_guids,
         )
         .await?;
@@ -2434,8 +2399,7 @@ pub async fn confirm_media_bulk_upload(
     .map_err(|err| {
         sentry::capture_message(
             &format!(
-                "confirm_media_bulk_upload: Failed to delete batch metadata for {}: {}",
-                batch_id_uuid, err
+                "confirm_media_bulk_upload: Failed to delete batch metadata for {batch_id_uuid}: {err}"
             ),
             sentry::Level::Error,
         );
@@ -2448,8 +2412,7 @@ pub async fn confirm_media_bulk_upload(
     tx.commit().await.map_err(|err| {
         sentry::capture_message(
             &format!(
-                "confirm_media_bulk_upload: Failed to commit transaction for batch {}: {}",
-                batch_id_uuid, err
+                "confirm_media_bulk_upload: Failed to commit transaction for batch {batch_id_uuid}: {err}"
             ),
             sentry::Level::Error,
         );
@@ -2589,54 +2552,52 @@ async fn validate_media_stream(
         });
     }
 
-    let detected = match detect_supported_media(&content) {
-        Some(media) => media,
-        None => {
-            let detected_mime = detect_mime(&content).unwrap_or("unknown").to_string();
+    let detected = if let Some(media) = detect_supported_media(&content) {
+        media
+    } else {
+        let detected_mime = detect_mime(&content).unwrap_or("unknown").to_string();
 
-            // Enhanced diagnostic logging for false negatives
-            let byte_preview = create_byte_preview(&content, 64);
-            let text_preview = create_text_preview(&content, 200);
-            let file_size = content.len();
+        // Enhanced diagnostic logging for false negatives
+        let byte_preview = create_byte_preview(&content, 64);
+        let text_preview = create_text_preview(&content, 200);
+        let file_size = content.len();
 
-            // Check what heuristics say about the file
-            let is_svg_heuristic = looks_like_svg(&content);
-            let is_webp_heuristic = looks_like_webp(&content);
-            let is_ogg_heuristic = looks_like_ogg(&content);
-            let is_mp3_heuristic = looks_like_mp3(&content);
+        // Check what heuristics say about the file
+        let is_svg_heuristic = looks_like_svg(&content);
+        let is_webp_heuristic = looks_like_webp(&content);
+        let is_ogg_heuristic = looks_like_ogg(&content);
+        let is_mp3_heuristic = looks_like_mp3(&content);
 
-            sentry::with_scope(
-                |scope| {
-                    scope.set_fingerprint(Some(["media-detection-failed"].as_ref()));
-                    scope.set_extra("expected_hash", expected_hash.into());
-                    scope.set_extra("file_size", file_size.into());
-                    scope.set_extra("detected_mime", detected_mime.clone().into());
-                    scope.set_extra("byte_preview", byte_preview.clone().into());
-                    if let Some(ref tp) = text_preview {
-                        scope.set_extra("text_preview", tp.clone().into());
-                    }
-                    scope.set_extra("heuristic_svg", is_svg_heuristic.into());
-                    scope.set_extra("heuristic_webp", is_webp_heuristic.into());
-                    scope.set_extra("heuristic_ogg", is_ogg_heuristic.into());
-                    scope.set_extra("heuristic_mp3", is_mp3_heuristic.into());
-                    scope.set_tag("detection_failure", "true");
-                },
-                || {
-                    sentry::capture_message(
-                        &format!(
-                            "[MEDIA] Detection failed: mime={}, size={}, svg_heuristic={}, bytes={}",
-                            detected_mime, file_size, is_svg_heuristic, byte_preview
-                        ),
-                        sentry::Level::Warning,
-                    );
-                },
-            );
+        sentry::with_scope(
+            |scope| {
+                scope.set_fingerprint(Some(["media-detection-failed"].as_ref()));
+                scope.set_extra("expected_hash", expected_hash.into());
+                scope.set_extra("file_size", file_size.into());
+                scope.set_extra("detected_mime", detected_mime.clone().into());
+                scope.set_extra("byte_preview", byte_preview.clone().into());
+                if let Some(ref tp) = text_preview {
+                    scope.set_extra("text_preview", tp.clone().into());
+                }
+                scope.set_extra("heuristic_svg", is_svg_heuristic.into());
+                scope.set_extra("heuristic_webp", is_webp_heuristic.into());
+                scope.set_extra("heuristic_ogg", is_ogg_heuristic.into());
+                scope.set_extra("heuristic_mp3", is_mp3_heuristic.into());
+                scope.set_tag("detection_failure", "true");
+            },
+            || {
+                sentry::capture_message(
+                    &format!(
+                        "[MEDIA] Detection failed: mime={detected_mime}, size={file_size}, svg_heuristic={is_svg_heuristic}, bytes={byte_preview}"
+                    ),
+                    sentry::Level::Warning,
+                );
+            },
+        );
 
-            return Ok(ContentValidationOutcome::Invalid {
-                reason: "unsupported_media",
-                mime: Some(detected_mime),
-            });
-        }
+        return Ok(ContentValidationOutcome::Invalid {
+            reason: "unsupported_media",
+            mime: Some(detected_mime),
+        });
     };
 
     let mut hasher = Md5::new();
@@ -2669,7 +2630,11 @@ async fn validate_media_stream(
 }
 
 pub(crate) fn determine_content_type_by_name(file_name: &str) -> Option<String> {
-    let ext = file_name.split('.').last().unwrap_or("").to_lowercase();
+    let ext = file_name
+        .split('.')
+        .next_back()
+        .unwrap_or("")
+        .to_lowercase();
     EXTENSION_TO_MIME
         .iter()
         .find(|(candidate, _)| *candidate == ext)
@@ -2708,6 +2673,10 @@ enum FilenameRejectionReason {
 }
 
 fn check_filename_validity(filename: &str) -> Result<(), FilenameRejectionReason> {
+    const ALLOWED_EXTENSIONS: [&str; 11] = [
+        "jpg", "jpeg", "png", "gif", "webp", "svg", "bmp", "tif", "tiff", "mp3", "ogg",
+    ];
+
     // Minimum length 4 allows valid filenames like "a.png" (1 char + dot + 3 char extension)
     if filename.is_empty() || filename.len() < 4 {
         return Err(FilenameRejectionReason::EmptyOrTooShort);
@@ -2753,7 +2722,7 @@ fn check_filename_validity(filename: &str) -> Result<(), FilenameRejectionReason
     if !filename
         .chars()
         .next()
-        .map_or(false, |c| char::is_alphanumeric(c) || c == '_')
+        .is_some_and(|c| char::is_alphanumeric(c) || c == '_')
     {
         return Err(FilenameRejectionReason::InvalidStartChar);
     }
@@ -2769,10 +2738,6 @@ fn check_filename_validity(filename: &str) -> Result<(), FilenameRejectionReason
         None => return Err(FilenameRejectionReason::NoExtension),
     };
 
-    const ALLOWED_EXTENSIONS: [&str; 11] = [
-        "jpg", "jpeg", "png", "gif", "webp", "svg", "bmp", "tif", "tiff", "mp3", "ogg",
-    ];
-
     if !ALLOWED_EXTENSIONS.contains(&ext.as_str()) {
         return Err(FilenameRejectionReason::DisallowedExtension(ext));
     }
@@ -2784,7 +2749,7 @@ fn is_allowed_extension(filename: &str) -> bool {
     check_filename_validity(filename).is_ok()
 }
 
-/// Like is_allowed_extension, but logs the rejection reason to Sentry for diagnostics
+/// Like `is_allowed_extension`, but logs the rejection reason to Sentry for diagnostics
 fn is_allowed_extension_with_logging(filename: &str, user_id: i64) -> bool {
     match check_filename_validity(filename) {
         Ok(()) => true,
@@ -2795,8 +2760,7 @@ fn is_allowed_extension_with_logging(filename: &str, user_id: i64) -> bool {
             sentry::add_breadcrumb(sentry::Breadcrumb {
                 category: Some("media_validation".into()),
                 message: Some(format!(
-                    "Filename rejected: reason={:?}, ext='{}', anon={}, user={}",
-                    reason, ext, anon_filename, user_id
+                    "Filename rejected: reason={reason:?}, ext='{ext}', anon={anon_filename}, user={user_id}"
                 )),
                 level: sentry::Level::Info,
                 ..Default::default()
@@ -2848,8 +2812,7 @@ pub async fn get_media_manifest(
     let db_client = state.db_pool.get_owned().await.map_err(|err| {
         sentry::capture_message(
             &format!(
-                "get_media_manifest: Failed to get database connection for user {}: {}",
-                user_id, err
+                "get_media_manifest: Failed to get database connection for user {user_id}: {err}"
             ),
             sentry::Level::Error,
         );
@@ -2929,8 +2892,7 @@ pub async fn get_media_manifest(
     {
         sentry::capture_message(
             &format!(
-                "Download limit exceeded for user {} (IP: {}, requested: {} files)",
-                user_id, ip_address, length_vec
+                "Download limit exceeded for user {user_id} (IP: {ip_address}, requested: {length_vec} files)"
             ),
             sentry::Level::Warning,
         );
@@ -2971,10 +2933,7 @@ pub async fn get_media_manifest(
 
         file_entries.push(MediaDownloadItem {
             filename,
-            download_url: format!(
-                "{}/v1/media/{}?token={}",
-                base_url_trimmed, hash, download_token
-            ),
+            download_url: format!("{base_url_trimmed}/v1/media/{hash}?token={download_token}"),
         });
     }
 
@@ -2992,17 +2951,17 @@ pub async fn sanitize_svg_batch(
     State(_state): State<Arc<AppState>>,
     Json(req): Json<SvgSanitizeRequest>,
 ) -> Result<Json<SvgSanitizeResponse>, (StatusCode, String)> {
+    // Limit batch size
+    const MAX_BATCH_SIZE: usize = 250;
+    const MAX_TOTAL_SIZE: usize = 1024 * 1024; // 1 MB total batch size
+
     // Auth is already validated by the extractor
-    let _user_id = auth_user.user_id;
+    let _ = auth_user.user_id;
 
     // Validate request
     if req.svg_files.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "No SVG files provided".to_string()));
     }
-
-    // Limit batch size
-    const MAX_BATCH_SIZE: usize = 250;
-    const MAX_TOTAL_SIZE: usize = 1024 * 1024; // 1 MB total batch size
 
     if req.svg_files.len() > MAX_BATCH_SIZE {
         return Err((

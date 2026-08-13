@@ -1,5 +1,12 @@
 // Duplicated code from the website. but since we have auto-approve (unfortunately) we have to handle this in the backend as well.
-use once_cell::sync::Lazy;
+// Casts convert DB field positions between u32/i32; values are validated and in range.
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss
+)]
+
 use regex::Regex;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -12,21 +19,24 @@ use tokio_postgres::Error as PgError;
 
 type SharedConn = PooledConnection<'static, PostgresConnectionManager<tokio_postgres::NoTls>>;
 
-/// Inheritance info for a subscriber note: (base_note_id, subscribed_fields)
-/// subscribed_fields = None means all fields are inherited
-/// subscribed_fields = Some([0, 1, 2]) means only those field positions are inherited
+/// Inheritance info for a subscriber note: (`base_note_id`, `subscribed_fields`)
+/// `subscribed_fields` = None means all fields are inherited
+/// `subscribed_fields` = Some([0, 1, 2]) means only those field positions are inherited
 pub struct NoteInheritanceInfo {
     pub base_note_id: i64,
     pub subscribed_fields: Option<Vec<i32>>,
 }
 
-static SOUND_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"\[sound:(.*?)\]").unwrap());
-static IMG_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r#"<img[^>]*src=["']([^"']*)["'][^>]*>"#).unwrap());
-static CSS_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r#"url\(["']?([^"')]+)["']?\)"#).unwrap());
-static SRC_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r#"(?i)(?:src|xlink:href)=["']([^"']+)["']"#).unwrap());
-static LATEX_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"latex-image-\w+\.png").unwrap());
+static SOUND_REGEX: std::sync::LazyLock<Regex> =
+    std::sync::LazyLock::new(|| Regex::new(r"\[sound:(.*?)\]").unwrap());
+static IMG_REGEX: std::sync::LazyLock<Regex> =
+    std::sync::LazyLock::new(|| Regex::new(r#"<img[^>]*src=["']([^"']*)["'][^>]*>"#).unwrap());
+static CSS_REGEX: std::sync::LazyLock<Regex> =
+    std::sync::LazyLock::new(|| Regex::new(r#"url\(["']?([^"')]+)["']?\)"#).unwrap());
+static SRC_REGEX: std::sync::LazyLock<Regex> =
+    std::sync::LazyLock::new(|| Regex::new(r#"(?i)(?:src|xlink:href)=["']([^"']+)["']"#).unwrap());
+static LATEX_REGEX: std::sync::LazyLock<Regex> =
+    std::sync::LazyLock::new(|| Regex::new(r"latex-image-\w+\.png").unwrap());
 
 /// Extract all media references from a field content string as anki does
 #[must_use]
@@ -117,7 +127,7 @@ async fn get_existing_references(
 }
 
 /// Get inheritance info for a batch of notes
-/// Returns a map of subscriber_note_id -> NoteInheritanceInfo
+/// Returns a map of `subscriber_note_id` -> `NoteInheritanceInfo`
 async fn get_inheritance_info_batch(
     client: &SharedConn,
     note_ids: &[i64],
@@ -152,8 +162,8 @@ async fn get_inheritance_info_batch(
     Ok(result)
 }
 
-/// Batch version of resolve_media_owner_for_upload for use within a transaction
-/// Returns a map of (subscriber_note_id, filename) -> owner_note_id
+/// Batch version of `resolve_media_owner_for_upload` for use within a transaction
+/// Returns a map of (`subscriber_note_id`, filename) -> `owner_note_id`
 pub async fn resolve_media_owners_batch_tx(
     tx: &tokio_postgres::Transaction<'_>,
     note_files: &[(i64, String)], // Vec of (note_id, filename)
@@ -203,7 +213,9 @@ pub async fn resolve_media_owners_batch_tx(
         .collect();
 
     // Batch fetch base note fields
-    let base_fields: HashMap<i64, HashMap<i32, String>> = if !base_note_ids.is_empty() {
+    let base_fields: HashMap<i64, HashMap<i32, String>> = if base_note_ids.is_empty() {
+        HashMap::new()
+    } else {
         let rows = tx
             .query(
                 "SELECT note, position, content FROM fields WHERE note = ANY($1)",
@@ -221,8 +233,6 @@ pub async fn resolve_media_owners_batch_tx(
                 .insert(position as i32, content);
         }
         map
-    } else {
-        HashMap::new()
     };
 
     // Process each (note_id, filename) pair
@@ -242,7 +252,7 @@ pub async fn resolve_media_owners_batch_tx(
                     Some(positions) => {
                         // Only check subscribed positions
                         positions.iter().any(|pos| {
-                            fields.get(pos).map_or(false, |content| {
+                            fields.get(pos).is_some_and(|content| {
                                 extract_media_references(content).contains(filename.as_str())
                             })
                         })
@@ -317,6 +327,8 @@ pub async fn get_missing_media(
     client: &SharedConn,
     deck_hash: &str,
 ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+    const BATCH_SIZE: usize = 1000;
+
     let notes_query = client
         .query(
             "WITH RECURSIVE deck_tree AS (
@@ -335,7 +347,6 @@ pub async fn get_missing_media(
         return Ok(Vec::new());
     }
 
-    const BATCH_SIZE: usize = 1000;
     let mut missing_media = HashSet::new();
 
     // Process notes in batches
@@ -378,7 +389,9 @@ pub async fn get_missing_media(
             .await?;
 
         // Also fetch base note media references for inherited notes
-        let base_refs_map: HashMap<i64, HashSet<String>> = if !base_note_ids.is_empty() {
+        let base_refs_map: HashMap<i64, HashSet<String>> = if base_note_ids.is_empty() {
+            HashMap::new()
+        } else {
             let base_refs_rows = client
                 .query(
                     "SELECT note_id, json_agg(file_name) as refs_json
@@ -404,12 +417,12 @@ pub async fn get_missing_media(
                 map.insert(note_id, refs);
             }
             map
-        } else {
-            HashMap::new()
         };
 
         // Also fetch base note field contents for subscribed field filtering
-        let base_fields_map: HashMap<i64, HashMap<i32, String>> = if !base_note_ids.is_empty() {
+        let base_fields_map: HashMap<i64, HashMap<i32, String>> = if base_note_ids.is_empty() {
+            HashMap::new()
+        } else {
             let base_fields_rows = client
                 .query(
                     "SELECT note, position, content FROM fields 
@@ -428,8 +441,6 @@ pub async fn get_missing_media(
                     .insert(position as i32, content);
             }
             map
-        } else {
-            HashMap::new()
         };
 
         let batch_missing_media: HashSet<String> = query_rows

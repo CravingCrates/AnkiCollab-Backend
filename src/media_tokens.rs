@@ -63,7 +63,7 @@ impl MediaTokenService {
                 Self::ensure_not_expired(claims.exp)?;
                 Ok(claims)
             }
-            _ => Err(MediaTokenError::TokenTypeMismatch),
+            TokenPayload::Download(_) => Err(MediaTokenError::TokenTypeMismatch),
         }
     }
 
@@ -93,7 +93,7 @@ impl MediaTokenService {
                 Self::ensure_not_expired(claims.exp)?;
                 Ok(claims)
             }
-            _ => Err(MediaTokenError::TokenTypeMismatch),
+            TokenPayload::Upload(_) => Err(MediaTokenError::TokenTypeMismatch),
         }
     }
 
@@ -182,17 +182,17 @@ pub enum MediaTokenError {
 impl fmt::Display for MediaTokenError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            MediaTokenError::InvalidSecret => {
+            Self::InvalidSecret => {
                 write!(f, "Media token secret must be at least 32 bytes")
             }
-            MediaTokenError::InvalidTtl => write!(f, "Invalid token TTL"),
-            MediaTokenError::InvalidFormat => write!(f, "Invalid token format"),
-            MediaTokenError::InvalidSignature => write!(f, "Invalid token signature"),
-            MediaTokenError::TokenTypeMismatch => write!(f, "Token type mismatch"),
-            MediaTokenError::Expired => write!(f, "Token expired"),
-            MediaTokenError::UnsupportedVersion(v) => write!(f, "Unsupported token version: {v}"),
-            MediaTokenError::Decode(err) => write!(f, "Token decode error: {err}"),
-            MediaTokenError::Serialization(err) => write!(f, "Token serialization error: {err}"),
+            Self::InvalidTtl => write!(f, "Invalid token TTL"),
+            Self::InvalidFormat => write!(f, "Invalid token format"),
+            Self::InvalidSignature => write!(f, "Invalid token signature"),
+            Self::TokenTypeMismatch => write!(f, "Token type mismatch"),
+            Self::Expired => write!(f, "Token expired"),
+            Self::UnsupportedVersion(v) => write!(f, "Unsupported token version: {v}"),
+            Self::Decode(err) => write!(f, "Token decode error: {err}"),
+            Self::Serialization(err) => write!(f, "Token serialization error: {err}"),
         }
     }
 }

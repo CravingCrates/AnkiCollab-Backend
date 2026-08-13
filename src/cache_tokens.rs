@@ -132,16 +132,16 @@ pub enum CacheTokenError {
 impl std::fmt::Display for CacheTokenError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CacheTokenError::InvalidSecret => {
+            Self::InvalidSecret => {
                 write!(f, "Cache token secret must be at least 32 bytes")
             }
-            CacheTokenError::InvalidTtl => write!(f, "Invalid token TTL"),
-            CacheTokenError::InvalidFormat => write!(f, "Invalid token format"),
-            CacheTokenError::InvalidSignature => write!(f, "Invalid token signature"),
-            CacheTokenError::Expired => write!(f, "Token expired"),
-            CacheTokenError::UnsupportedVersion(v) => write!(f, "Unsupported token version: {v}"),
-            CacheTokenError::Decode(err) => write!(f, "Token decode error: {err}"),
-            CacheTokenError::Serialization(err) => write!(f, "Token serialization error: {err}"),
+            Self::InvalidTtl => write!(f, "Invalid token TTL"),
+            Self::InvalidFormat => write!(f, "Invalid token format"),
+            Self::InvalidSignature => write!(f, "Invalid token signature"),
+            Self::Expired => write!(f, "Token expired"),
+            Self::UnsupportedVersion(v) => write!(f, "Unsupported token version: {v}"),
+            Self::Decode(err) => write!(f, "Token decode error: {err}"),
+            Self::Serialization(err) => write!(f, "Token serialization error: {err}"),
         }
     }
 }

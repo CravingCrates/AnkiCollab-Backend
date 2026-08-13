@@ -1,4 +1,20 @@
-#![warn(clippy::all, clippy::pedantic, clippy::nursery)]
+#![warn(clippy::all)]
+#![warn(clippy::pedantic)]
+#![allow(
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    clippy::too_many_lines,
+    clippy::manual_let_else,
+    clippy::implicit_hasher,
+    clippy::similar_names,
+    clippy::case_sensitive_file_extension_comparisons,
+    // Rate-limit math and latency metrics intentionally convert between f64/u64/u32/u128
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+)]
+
 pub mod auth;
 pub mod cache_manager;
 pub mod cache_proxy;
@@ -15,9 +31,9 @@ pub mod media_manager;
 pub mod media_proxy;
 pub mod media_reference_manager;
 pub mod media_tokens;
-pub mod notifications;
 pub mod note_removal;
 pub mod notetypes;
+pub mod notifications;
 pub mod pull;
 pub mod push;
 pub mod rate_limiter;
@@ -38,12 +54,10 @@ use s3_throttle::S3Throttle;
 use tokio::signal;
 use tokio::sync::RwLock;
 
-use tower_http::{
-    classify::ServerErrorsFailureClass,
-    trace::TraceLayer,
-};
+use tower_http::{classify::ServerErrorsFailureClass, trace::TraceLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+use auth::AuthenticatedUser;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -52,7 +66,6 @@ use axum::{
     Json,
 };
 use axum_client_ip::{ClientIp, ClientIpSource};
-use auth::AuthenticatedUser;
 
 use std::fs;
 use std::net::SocketAddr;
@@ -61,14 +74,12 @@ use base64::{engine::general_purpose, Engine as _};
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
-use std::io::Write;
-use sha2::{Digest, Sha256};
 use hex::encode;
+use sha2::{Digest, Sha256};
+use std::io::Write;
 
-use tower_governor::{
-    governor::GovernorConfigBuilder, GovernorLayer,
-};
 use crate::user_ip_key_extractor::UserOrIpKeyExtractor;
+use tower_governor::{governor::GovernorConfigBuilder, GovernorLayer};
 
 use aws_sdk_s3::Client as S3Client;
 use media_tokens::MediaTokenService;
@@ -133,10 +144,7 @@ fn validate_deck_hash(deck_hash: &str) -> bool {
         .iter()
         .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_alphabetic()))
     {
-        eprintln!(
-            "Invalid deck hash format (invalid characters): {}",
-            deck_hash
-        );
+        eprintln!("Invalid deck hash format (invalid characters): {deck_hash}");
         return false;
     }
 
@@ -146,15 +154,12 @@ fn validate_deck_hash(deck_hash: &str) -> bool {
 fn read_cached_json(file_name: &str) -> Option<String> {
     // Validate that filename ends with .json
     if !file_name.ends_with(".json") {
-        eprintln!("Invalid filename: must end with .json: {}", file_name);
+        eprintln!("Invalid filename: must end with .json: {file_name}");
         return None;
     }
 
     if file_name.contains('/') || file_name.contains('\\') || file_name.contains("..") {
-        eprintln!(
-            "Invalid filename: path separators are not allowed: {}",
-            file_name
-        );
+        eprintln!("Invalid filename: path separators are not allowed: {file_name}");
         return None;
     }
 
@@ -179,23 +184,17 @@ fn read_cached_json(file_name: &str) -> Option<String> {
     };
 
     if !canonical_candidate.starts_with(&canonical_base) {
-        eprintln!(
-            "Rejected cache file read outside base directory: {}",
-            file_name
-        );
+        eprintln!("Rejected cache file read outside base directory: {file_name}");
         return None;
     }
 
-    match fs::read_to_string(canonical_candidate) {
-        Ok(data) => Some(data),
-        Err(_) => None,
-    }
+    fs::read_to_string(canonical_candidate).ok()
 }
 
 fn preview_str(s: &str, max: usize) -> String {
     let mut p = s.chars().take(max).collect::<String>();
     if s.len() > max {
-        p.push_str("…");
+        p.push('…');
     }
     p
 }
@@ -228,19 +227,22 @@ fn decompress_data(engine: &general_purpose::GeneralPurpose, data: &str) -> Resu
     // Decompress gzip with size limit to prevent zip bombs
     let decoder = GzDecoder::new(&bytes[..]);
     let mut decoded_data = String::new();
-    decoder.take(MAX_DECOMPRESSED_SIZE).read_to_string(&mut decoded_data).map_err(|e| {
-        sentry::add_breadcrumb(sentry::Breadcrumb {
-            category: Some("decode".into()),
-            message: Some(format!(
-                "gzip decompress failed; compressed_size={}, err={}",
-                bytes.len(),
-                e
-            )),
-            level: sentry::Level::Warning,
-            ..Default::default()
-        });
-        "Decompression error".to_string()
-    })?;
+    decoder
+        .take(MAX_DECOMPRESSED_SIZE)
+        .read_to_string(&mut decoded_data)
+        .map_err(|e| {
+            sentry::add_breadcrumb(sentry::Breadcrumb {
+                category: Some("decode".into()),
+                message: Some(format!(
+                    "gzip decompress failed; compressed_size={}, err={}",
+                    bytes.len(),
+                    e
+                )),
+                level: sentry::Level::Warning,
+                ..Default::default()
+            });
+            "Decompression error".to_string()
+        })?;
 
     if decoded_data.len() as u64 >= MAX_DECOMPRESSED_SIZE {
         return Err("Decompressed data exceeds size limit".to_string());
@@ -284,12 +286,11 @@ pub async fn process_card(
             }
         };
         let info: structs::SubmitCardReq =
-            match serde_json::from_str::<structs::SubmitCardReq>(&decompressed_data) {
-                Ok(data) => data,
-                Err(_) => {
-                    send((StatusCode::BAD_REQUEST, "Invalid data".to_string()));
-                    return;
-                }
+            if let Ok(data) = serde_json::from_str::<structs::SubmitCardReq>(&decompressed_data) {
+                data
+            } else {
+                send((StatusCode::BAD_REQUEST, "Invalid data".to_string()));
+                return;
             };
 
         if !validate_deck_hash(&info.remote_deck) {
@@ -300,16 +301,15 @@ pub async fn process_card(
             return;
         }
 
-        let mut anki_deck = match structs::AnkiDeck::from_json_string(&info.deck) {
-            Ok(deck) => deck,
-            Err(_) => {
-                send((StatusCode::BAD_REQUEST, "Invalid deck data".to_string()));
-                return;
-            }
+        let mut anki_deck = if let Ok(deck) = structs::AnkiDeck::from_json_string(&info.deck) {
+            deck
+        } else {
+            send((StatusCode::BAD_REQUEST, "Invalid deck data".to_string()));
+            return;
         };
 
         let committing_user: Option<i32> = authed_user_id;
-        let commit_id = match suggestion::create_new_commit(
+        let commit_id = if let Ok(val) = suggestion::create_new_commit(
             &state_cloned,
             info.rationale,
             &info.commit_text,
@@ -318,22 +318,19 @@ pub async fn process_card(
         )
         .await
         {
-            Ok(val) => val,
-            Err(_) => {
-                send((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Internal Error occurred. Damn!".to_string(),
-                ));
-                return;
-            }
+            val
+        } else {
+            send((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal Error occurred. Damn!".to_string(),
+            ));
+            return;
         };
 
         let is_owner_or_maintainer = match authed_user_id {
-            Some(uid) => {
-                auth::is_deck_owner_or_maintainer(&state_cloned, uid, &info.remote_deck)
-                    .await
-                    .unwrap_or_default()
-            }
+            Some(uid) => auth::is_deck_owner_or_maintainer(&state_cloned, uid, &info.remote_deck)
+                .await
+                .unwrap_or_default(),
             None => false,
         };
         let mut force_overwrite = false;
@@ -341,7 +338,7 @@ pub async fn process_card(
             force_overwrite = info.force_overwrite;
         }
 
-        let deck_path = match suggestion::fix_deck_name(
+        let deck_path = if let Ok(val) = suggestion::fix_deck_name(
             &state_cloned,
             &info.deck_path,
             &info.new_name,
@@ -349,14 +346,13 @@ pub async fn process_card(
         )
         .await
         {
-            Ok(val) => val,
-            Err(_) => {
-                send((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Invalid Deck Name".to_string(),
-                ));
-                return;
-            }
+            val
+        } else {
+            send((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Invalid Deck Name".to_string(),
+            ));
+            return;
         };
         for deck in &mut anki_deck.children {
             suggestion::update_deck_names(deck).await;
@@ -366,7 +362,7 @@ pub async fn process_card(
             Ok(pool) => pool,
             Err(err) => {
                 sentry::capture_message(
-                    &format!("process_card: Failed to get pool: {}", err),
+                    &format!("process_card: Failed to get pool: {err}"),
                     sentry::Level::Error,
                 );
                 send((
@@ -405,7 +401,7 @@ pub async fn process_card(
             Ok((deck_id, owner)) => (deck_id, owner),
             Err(_error) => {
                 // Expected case - user tried to submit to non-existent deck
-                return send((StatusCode::UNPROCESSABLE_ENTITY, r#"Deck not found. If this is a new subdeck, try to suggest the entire deck tree from the sideview."#.to_owned()));
+                return send((StatusCode::UNPROCESSABLE_ENTITY, r"Deck not found. If this is a new subdeck, try to suggest the entire deck tree from the sideview.".to_owned()));
             }
         };
 
@@ -439,9 +435,9 @@ pub async fn process_card(
         {
             Ok(rows) => rows.iter().map(|row| row.get::<_, i64>(0)).collect(),
             Err(e) => {
-                error::AppError::db_query("process_card", format!("Deck tree query failed: {}", e))
+                error::AppError::db_query("process_card", format!("Deck tree query failed: {e}"))
                     .with_context("deck_hash", info.remote_deck.clone())
-                    .with_context("deck_id", format!("{:?}", deck_id))
+                    .with_context("deck_id", format!("{deck_id:?}"))
                     .report_to_sentry();
                 send((
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -471,20 +467,32 @@ pub async fn process_card(
                 // Note processing failures are ALWAYS bugs - they shouldn't happen
                 // The only "expected" errors are user-input validation which should be caught earlier
                 let err_str = err.to_string();
-                
+
                 // Only skip expected user input errors (deck hash format, auth)
                 let is_user_error = err_str.contains("Invalid deck hash")
                     || err_str.contains("unauthorized")
                     || err_str.contains("permission denied");
-                
+
                 if !is_user_error {
                     // This is a bug - note processing failed unexpectedly
-                    error::AppError::bug("process_card/suggestion", format!("Note processing failed: {}", err))
-                        .with_context("deck_hash", info.remote_deck.clone())
-                        .with_context("deck_path", deck_path.clone())
-                        .with_context("commit_id", commit_id.to_string())
-                        .with_context("error_type", if err_str.contains("validation") { "validation" } else if err_str.contains("duplicate") { "duplicate" } else { "unknown" })
-                        .report_to_sentry();
+                    error::AppError::bug(
+                        "process_card/suggestion",
+                        format!("Note processing failed: {err}"),
+                    )
+                    .with_context("deck_hash", info.remote_deck.clone())
+                    .with_context("deck_path", deck_path.clone())
+                    .with_context("commit_id", commit_id.to_string())
+                    .with_context(
+                        "error_type",
+                        if err_str.contains("validation") {
+                            "validation"
+                        } else if err_str.contains("duplicate") {
+                            "duplicate"
+                        } else {
+                            "unknown"
+                        },
+                    )
+                    .report_to_sentry();
                 }
                 send((StatusCode::UNPROCESSABLE_ENTITY, err.to_string()));
             }
@@ -564,7 +572,12 @@ pub async fn upload_deck_stats(
     // Derive user_hash from authenticated user
     let username = match auth::get_username_by_user_id(&state, auth_user.user_id).await {
         Ok(u) => u,
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Could not resolve user".to_string()),
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not resolve user".to_string(),
+            )
+        }
     };
     let user_hash = {
         let mut hasher = Sha256::new();
@@ -585,7 +598,7 @@ pub async fn upload_deck_stats(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "upload_deck_stats",
                     "Stats upload failed",
-                    format!("Stats insertion error: {}", err),
+                    format!("Stats insertion error: {err}"),
                 )
                 .with_context("deck_hash", deck_hash_for_error)
                 .report_to_sentry();
@@ -608,8 +621,11 @@ pub async fn confirm_media_bulk_async(
             Ok(_) => {}
             Err(err) => {
                 // Media confirmation failure is a bug worth investigating
-                error::AppError::bug("confirm_media_bulk", format!("Media bulk confirm failed: {:?}", err))
-                    .report_to_sentry();
+                error::AppError::bug(
+                    "confirm_media_bulk",
+                    format!("Media bulk confirm failed: {err:?}"),
+                )
+                .report_to_sentry();
             }
         }
     });
@@ -624,10 +640,7 @@ pub async fn check_for_update(
     let mut responses: Vec<Value> = Vec::with_capacity(input.iter().len());
 
     if input.len() > 50 {
-        return (
-            StatusCode::BAD_REQUEST,
-            "Too many deck entries".to_string(),
-        );
+        return (StatusCode::BAD_REQUEST, "Too many deck entries".to_string());
     }
 
     // if there is just one entry and its not a valid deck hash, return bad request
@@ -835,7 +848,7 @@ pub async fn post_data(
             // Malformed client payload - expected behavior, just breadcrumb
             sentry::add_breadcrumb(sentry::Breadcrumb {
                 category: Some("decode".into()),
-                message: Some(format!("/createDeck AnkiDeck parse failed: {}", e)),
+                message: Some(format!("/createDeck AnkiDeck parse failed: {e}")),
                 level: sentry::Level::Info,
                 ..Default::default()
             });
@@ -916,7 +929,7 @@ pub async fn post_data(
                 return;
             }
         };
-        
+
         // Fill notes and any child decks; root is already created above
         match push::unpack_deck_data(
             &mut client2,
@@ -942,7 +955,7 @@ pub async fn post_data(
                 }
             }
             Err(err) => {
-                error::AppError::bug("createDeck/unpack", format!("Deck unpacking failed: {}", err))
+                error::AppError::bug("createDeck/unpack", format!("Deck unpacking failed: {err}"))
                     .with_context("root_deck_id", root_deck_id.to_string())
                     .with_context("owner_hash", error::hash_pii(&owner_id.to_string()))
                     .with_context("commit_id", commit_id.to_string())
@@ -959,8 +972,7 @@ pub async fn post_data(
     });
 
     let response = format!(
-        r#"{{ "status": 1, "message": "{}", "bulk_operation_id": "{}" }}"#,
-        deck_status, bulk_operation_id
+        r#"{{ "status": 1, "message": "{deck_status}", "bulk_operation_id": "{bulk_operation_id}" }}"#
     );
     (StatusCode::OK, response)
 }
@@ -989,11 +1001,9 @@ pub async fn request_removal(
     let authed_user_id = auth_user.map(|u| u.user_id);
 
     let is_owner_or_maintainer = match authed_user_id {
-        Some(uid) => {
-            auth::is_deck_owner_or_maintainer(&db_state, uid, &info.remote_deck)
-                .await
-                .unwrap_or_default()
-        }
+        Some(uid) => auth::is_deck_owner_or_maintainer(&db_state, uid, &info.remote_deck)
+            .await
+            .unwrap_or_default(),
         None => false,
     };
 
@@ -1018,7 +1028,7 @@ pub async fn request_removal(
         Ok(_res) => (StatusCode::OK, "Success".to_string()),
         Err(err) => {
             // This is a real bug - note removal should work if inputs are valid
-            error::AppError::bug("request_removal", format!("Note removal failed: {}", err))
+            error::AppError::bug("request_removal", format!("Note removal failed: {err}"))
                 .with_context("deck_hash", info.remote_deck)
                 .report_to_sentry();
             (
@@ -1074,7 +1084,12 @@ pub async fn add_subscription(
     // Derive user_hash from authenticated user
     let username = match auth::get_username_by_user_id(&db_state, auth_user.user_id).await {
         Ok(u) => u,
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Could not resolve user".to_string()),
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not resolve user".to_string(),
+            )
+        }
     };
     let user_hash = {
         let mut hasher = Sha256::new();
@@ -1084,11 +1099,18 @@ pub async fn add_subscription(
 
     let deck_hash = request.deck_hash;
     match subscription::add(&db_state, deck_hash, user_hash).await {
-        Ok(res) => (StatusCode::OK, format!("{:?}", res)),
+        Ok(res) => (StatusCode::OK, format!("{res:?}")),
         Err(error) => {
             // Subscription failures are usually duplicate entries or invalid deck - expected
-            error::log_expected("add_subscription", StatusCode::UNPROCESSABLE_ENTITY, &error.to_string());
-            (StatusCode::UNPROCESSABLE_ENTITY, "Could not add subscription".to_string())
+            error::log_expected(
+                "add_subscription",
+                StatusCode::UNPROCESSABLE_ENTITY,
+                &error.to_string(),
+            );
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "Could not add subscription".to_string(),
+            )
         }
     }
 }
@@ -1107,7 +1129,12 @@ pub async fn remove_subscription(
     // Derive user_hash from authenticated user
     let username = match auth::get_username_by_user_id(&db_state, auth_user.user_id).await {
         Ok(u) => u,
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Could not resolve user".to_string()),
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not resolve user".to_string(),
+            )
+        }
     };
     let user_hash = {
         let mut hasher = Sha256::new();
@@ -1117,10 +1144,14 @@ pub async fn remove_subscription(
 
     let deck_hash = request.deck_hash;
     match subscription::remove(&db_state, deck_hash, user_hash).await {
-        Ok(res) => (StatusCode::OK, format!("{:?}", res)),
+        Ok(res) => (StatusCode::OK, format!("{res:?}")),
         Err(error) => {
             // Subscription not found - expected behavior
-            error::log_expected("remove_subscription", StatusCode::NOT_FOUND, &error.to_string());
+            error::log_expected(
+                "remove_subscription",
+                StatusCode::NOT_FOUND,
+                &error.to_string(),
+            );
             (StatusCode::NOT_FOUND, "Subscription not found".to_string())
         }
     }
@@ -1191,9 +1222,12 @@ pub async fn submit_changelog(
         ),
         Err(err) => {
             // This is a real bug if it fails - the user is authorized
-            error::AppError::bug("submit_changelog", format!("Changelog insert failed: {}", err))
-                .with_context("deck_hash", changelog_data.deck_hash.clone())
-                .report_to_sentry();
+            error::AppError::bug(
+                "submit_changelog",
+                format!("Changelog insert failed: {err}"),
+            )
+            .with_context("deck_hash", changelog_data.deck_hash.clone())
+            .report_to_sentry();
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "An error occurred while publishing the changelog.".to_string(),
@@ -1223,8 +1257,15 @@ pub async fn get_user_hash_from_token(
             (StatusCode::OK, serde_json::to_string(&hashed).unwrap())
         }
         Err(err) => {
-            error::log_expected("get_user_hash_from_token", StatusCode::INTERNAL_SERVER_ERROR, &err.to_string());
-            (StatusCode::INTERNAL_SERVER_ERROR, "Could not resolve user".to_string())
+            error::log_expected(
+                "get_user_hash_from_token",
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &err.to_string(),
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not resolve user".to_string(),
+            )
         }
     }
 }
@@ -1260,7 +1301,11 @@ async fn api_get_notifications(
     match notifications::get_unread_grouped(&db_state, auth_user.user_id).await {
         Ok(payload) => (StatusCode::OK, Json(payload)).into_response(),
         Err(err) => {
-            error::log_expected("api_get_notifications", StatusCode::INTERNAL_SERVER_ERROR, &err);
+            error::log_expected(
+                "api_get_notifications",
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &err,
+            );
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "Failed to fetch notifications"})),
@@ -1454,8 +1499,8 @@ async fn resolve_note_for_review(
         }
     };
 
-    let base_url =
-        std::env::var("WEBSITE_BASE_URL").unwrap_or_else(|_| "https://www.ankicollab.com".to_string());
+    let base_url = std::env::var("WEBSITE_BASE_URL")
+        .unwrap_or_else(|_| "https://www.ankicollab.com".to_string());
     let redirect_url = format!("{base_url}/review/{note_id}");
 
     axum::response::Redirect::to(&redirect_url).into_response()
@@ -1490,7 +1535,7 @@ fn media_routes() -> Router<Arc<AppState>> {
     );
 
     let governor_limiter = media_governor_conf.limiter().clone();
-    let interval = Duration::from_secs(60);
+    let interval = Duration::from_mins(1);
     // background task to prune governor state
     std::thread::spawn(move || loop {
         std::thread::sleep(interval);
@@ -1532,7 +1577,7 @@ async fn get_bucket_size(s3_client: &S3Client, s3_throttle: &S3Throttle, bucket:
         total_bytes = total_bytes.saturating_add(page_bytes);
 
         if page.is_truncated.unwrap_or(false) {
-            continuation_token = page.next_continuation_token.clone();
+            continuation_token.clone_from(&page.next_continuation_token);
             if continuation_token.is_none() {
                 println!("Paginator indicated truncation but no continuation token returned");
                 break;
@@ -1592,10 +1637,18 @@ async fn main() {
         env::var("SENTRY_URL").expect("SENTRY_URL must be set"),
         sentry::ClientOptions {
             release: sentry::release_name!(),
-            traces_sample_rate: 0.2,
+            traces_sample_rate: 0.0,
+            sample_rate: 1.0,
+            auto_session_tracking: false,
             max_breadcrumbs: 50,
             send_default_pii: false,
             before_send: Some(Arc::new(|mut event| {
+                static LAST_ERRORS: std::sync::LazyLock<
+                    std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+                > = std::sync::LazyLock::new(|| {
+                    std::sync::Mutex::new(std::collections::HashMap::new())
+                });
+
                 if let Some(user) = &mut event.user {
                     user.ip_address = None;
                     user.email = None;
@@ -1607,23 +1660,12 @@ async fn main() {
                     }
                 }
 
-                static LAST_ERRORS: once_cell::sync::Lazy<
-                    std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
-                > = once_cell::sync::Lazy::new(|| {
-                    std::sync::Mutex::new(std::collections::HashMap::new())
-                });
-
                 // Create a unique key for this event based on message and level
                 let event_key = format!(
                     "{}:{}:{}",
-                    event.message.as_ref().map(|m| m.as_str()).unwrap_or(""),
+                    event.message.as_deref().unwrap_or(""),
                     event.level,
-                    event
-                        .exception
-                        .values
-                        .first()
-                        .map(|e| e.ty.as_str())
-                        .unwrap_or("")
+                    event.exception.values.first().map_or("", |e| e.ty.as_str())
                 );
 
                 let mut last_errors = LAST_ERRORS.lock().unwrap();
@@ -1649,16 +1691,13 @@ async fn main() {
             before_breadcrumb: Some(Arc::new(|breadcrumb| {
                 // Only keep 30% of breadcrumbs to reduce noise
                 use std::collections::hash_map::RandomState;
-                use std::hash::{BuildHasher, Hash, Hasher};
+                use std::hash::BuildHasher;
 
-                let mut hasher = RandomState::new().build_hasher();
-                breadcrumb
-                    .message
-                    .as_ref()
-                    .unwrap_or(&String::new())
-                    .hash(&mut hasher);
-
-                if hasher.finish() % 10 < 3 {
+                if RandomState::new()
+                    .hash_one(breadcrumb.message.as_ref().unwrap_or(&String::new()))
+                    % 10
+                    < 3
+                {
                     Some(breadcrumb)
                 } else {
                     None
@@ -1791,7 +1830,9 @@ async fn main() {
             match media_manager::cleanup_orphaned_media_s3(cleanup_state, is_dry_run).await {
                 Ok(deleted_count) => {
                     if is_dry_run {
-                        println!("[DRY RUN] Orphaned media cleanup simulation completed successfully.");
+                        println!(
+                            "[DRY RUN] Orphaned media cleanup simulation completed successfully."
+                        );
                     } else {
                         println!("Orphaned media cleanup completed successfully. Deleted {deleted_count} objects.");
                     }
@@ -1816,7 +1857,7 @@ async fn main() {
         .expect("STRICT_API_RATE_LIMIT_PER_MINUTE must be set")
         .parse()
         .expect("Rate limit must be a valid number");
-    
+
     let standard_governor_conf = Arc::new(
         GovernorConfigBuilder::default()
             .per_second((f64::from(standard_api_ratelimit) / 60.0) as u64)
@@ -1836,11 +1877,11 @@ async fn main() {
             .finish()
             .unwrap(),
     );
-    
+
     let strict_governor_limiter = strict_governor_conf.limiter().clone();
     let standard_governor_limiter = standard_governor_conf.limiter().clone();
 
-    let interval = Duration::from_secs(60);
+    let interval = Duration::from_mins(1);
     // a separate background task to clean up
     std::thread::spawn(move || loop {
         std::thread::sleep(interval);
@@ -1849,15 +1890,15 @@ async fn main() {
     });
 
     // start media cleanup task
-    media_manager::start_cleanup_task(state.clone()).await;
+    media_manager::start_cleanup_task(state.clone());
 
     // start media token replay cache cleanup task
-    media_proxy::start_token_cleanup_task(state.clone()).await;
+    media_proxy::start_token_cleanup_task(state.clone());
 
     // start bulk operations cache cleanup task
     let bulk_cache_cleanup_state = state.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(300)); // 5 minutes
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_mins(5)); // 5 minutes
 
         loop {
             interval.tick().await;
@@ -1883,7 +1924,7 @@ async fn main() {
     // Schedule periodic cleanup of expired tokens
     let cleanup_state = state.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(86400)); // Daily
+        let mut interval = tokio::time::interval(Duration::from_hours(24)); // Daily
         loop {
             interval.tick().await;
 
@@ -1949,8 +1990,14 @@ async fn main() {
     // Build our application with routes
     let basic_routes = Router::new()
         .route("/pullChanges", post(check_for_update))
-        .route("/createDeck", post(post_data).layer(axum::extract::DefaultBodyLimit::max(250 * 1024 * 1024))) // 250 MB for deck creation
-        .route("/submitCard", post(process_card).layer(axum::extract::DefaultBodyLimit::max(250 * 1024 * 1024))) // 250 MB for card submission
+        .route(
+            "/createDeck",
+            post(post_data).layer(axum::extract::DefaultBodyLimit::max(250 * 1024 * 1024)),
+        ) // 250 MB for deck creation CAVE Change line 205 too MAX_DECOMPRESSED_SIZE
+        .route(
+            "/submitCard",
+            post(process_card).layer(axum::extract::DefaultBodyLimit::max(100 * 1024 * 1024)),
+        ) // 100 MB for card submission
         .route("/CheckDeckAlive", post(check_deck_alive))
         .route("/AddSubscription", post(add_subscription))
         .route("/RemoveSubscription", post(remove_subscription))
@@ -1958,13 +2005,25 @@ async fn main() {
         .route("/submitChangelog", post(submit_changelog))
         .route("/CreateDeckLink", post(create_deck_link))
         .route("/CreateNewNoteLink", post(create_note_links))
-        .route("/UploadDeckStats", post(upload_deck_stats).layer(axum::extract::DefaultBodyLimit::max(50 * 1024 * 1024))) // 50 MB for stats
+        .route(
+            "/UploadDeckStats",
+            post(upload_deck_stats).layer(axum::extract::DefaultBodyLimit::max(50 * 1024 * 1024)),
+        ) // 50 MB for stats
         .route("/requestRemoval", post(request_removal))
         .route("/GetNotifications", get(api_get_notifications))
-        .route("/GetNotificationsHistory", get(api_get_notifications_history))
+        .route(
+            "/GetNotificationsHistory",
+            get(api_get_notifications_history),
+        )
         .route("/MarkNotificationsRead", post(api_mark_notifications_read))
-        .route("/GetCommitSnapshot/{commit_id}", get(api_get_commit_snapshot))
-        .route("/GetProtectedFields/{deck_hash}", get(get_protected_fields_from_deck))
+        .route(
+            "/GetCommitSnapshot/{commit_id}",
+            get(api_get_commit_snapshot),
+        )
+        .route(
+            "/GetProtectedFields/{deck_hash}",
+            get(get_protected_fields_from_deck),
+        )
         .route("/resolveNoteForReview", post(resolve_note_for_review))
         .layer(GovernorLayer::new(standard_governor_conf));
 
@@ -1976,8 +2035,7 @@ async fn main() {
         .route("/refreshToken", post(refresh_auth_token))
         .layer(GovernorLayer::new(strict_governor_conf));
 
-    let media_routes = Router::new()
-        .nest("/media", media_routes());
+    let media_routes = Router::new().nest("/media", media_routes());
 
     let app = Router::new()
         .merge(basic_routes)
@@ -2031,14 +2089,14 @@ async fn main() {
                             ServerErrorsFailureClass::Error(msg) => {
                                 // Connection/protocol errors (client disconnect, etc.)
                                 // These are usually not bugs, but we log them as warnings
-                                let msg_str = msg.to_string();
-                                
+                                let msg_str = msg.clone();
+
                                 // Filter out expected connection issues
                                 let is_expected = msg_str.contains("connection reset")
                                     || msg_str.contains("broken pipe")
                                     || msg_str.contains("connection closed")
                                     || msg_str.contains("client disconnect");
-                                
+
                                 if !is_expected {
                                     sentry::with_scope(
                                         |scope| {
@@ -2048,7 +2106,7 @@ async fn main() {
                                         },
                                         || {
                                             sentry::capture_message(
-                                                &format!("Protocol/connection error: {}", msg_str),
+                                                &format!("Protocol/connection error: {msg_str}"),
                                                 sentry::Level::Warning,
                                             );
                                         },

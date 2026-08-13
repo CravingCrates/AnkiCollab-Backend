@@ -73,7 +73,7 @@ pub struct Note {
 #[derive(Deserialize, Serialize)]
 pub struct AnkiDeck {
     pub crowdanki_uuid: String,
-    pub children: Vec<AnkiDeck>,
+    pub children: Vec<Self>,
     pub desc: String,
     pub name: String,
     pub note_models: Option<Vec<Notetype>>,

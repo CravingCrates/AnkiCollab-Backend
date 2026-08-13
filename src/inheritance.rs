@@ -16,7 +16,7 @@ async fn get_deck_id(
         .await?;
     match row {
         Some(r) => Ok(r.get(0)),
-        None => Err(format!("Deck hash {} not found", deck_hash).into()),
+        None => Err(format!("Deck hash {deck_hash} not found").into()),
     }
 }
 
@@ -215,7 +215,7 @@ pub async fn create_note_links(
                 req.note_guids.len()
             );
             println!("Requested GUIDs: {:?}", req.note_guids);
-            println!("Subscriber deck subtree: {:?}", sub_tree);
+            println!("Subscriber deck subtree: {sub_tree:?}");
             // Print missing guids for debugging
             let found_guids: HashSet<String> = sub_guid_rows
                 .into_iter()
@@ -227,7 +227,7 @@ pub async fn create_note_links(
                 .filter(|g| !found_guids.contains(*g))
                 .cloned()
                 .collect();
-            println!("GUIDs not found: {:?}", missing_guids);
+            println!("GUIDs not found: {missing_guids:?}");
 
             return Err("Please upload the notes before linking them.".into());
         }
@@ -281,9 +281,9 @@ pub async fn create_note_links(
         ).await?;
         if base_rows.is_empty() {
             println!("No base notes found for guids chunk, skipping all");
-            println!("Guids: {:?}", guids);
-            println!("Base deck subtree: {:?}", base_tree);
-            println!("Subscriber deck subtree: {:?}", sub_tree);
+            println!("Guids: {guids:?}");
+            println!("Base deck subtree: {base_tree:?}");
+            println!("Subscriber deck subtree: {sub_tree:?}");
             skipped.extend(guids.clone());
             continue;
         }
@@ -357,7 +357,7 @@ pub async fn create_note_links(
                     eq
                 };
                 if !compatible {
-                    println!("Incompatible note types: sub_nt_id = {}, base_nt_id = {}, Skipping note guid {}", sub_nt_id, base_nt_id, base_guid);
+                    println!("Incompatible note types: sub_nt_id = {sub_nt_id}, base_nt_id = {base_nt_id}, Skipping note guid {base_guid}");
                     skipped.push(base_guid);
                     continue;
                 }
@@ -373,7 +373,7 @@ pub async fn create_note_links(
                     .await?;
 
                 if circular_note_check.is_some() {
-                    println!("Circular inheritance detected: base note {} already inherits from subscriber note {}, skipping", base_note_id, sub_id);
+                    println!("Circular inheritance detected: base note {base_note_id} already inherits from subscriber note {sub_id}, skipping");
                     skipped.push(base_guid);
                     continue;
                 }
@@ -389,7 +389,7 @@ pub async fn create_note_links(
                 // Remove duplicate locally-reviewed addition tags (action=true, reviewed=true) that also exist on the base note.
                 // We deliberately keep unreviewed suggestions and removals so user intent isn't lost.
                 tx.execute(
-                    r#"
+                    r"
                     DELETE FROM tags ts
                     WHERE ts.note = $1
                        AND ts.reviewed = true AND ts.action = true
@@ -399,7 +399,7 @@ pub async fn create_note_links(
                             tb.content = ts.content AND 
                             tb.reviewed = true AND 
                             tb.action = true
-                       )"#,
+                       )",
                     &[sub_id, &base_note_id],
                 )
                 .await?;
@@ -409,14 +409,14 @@ pub async fn create_note_links(
                     None => {
                         // subscribe all: keep a single preferred field row, delete the rest
                         tx.execute(
-                            r#"
+                            r"
                             WITH keep AS (
                             SELECT id FROM fields WHERE note = $1
                             ORDER BY (position = 0) DESC, (content <> '') DESC, position, id
                             LIMIT 1
                             )
                             DELETE FROM fields WHERE note = $1 AND id NOT IN (SELECT id FROM keep)
-                            "#,
+                            ",
                             &[sub_id],
                         )
                         .await?;
@@ -433,10 +433,7 @@ pub async fn create_note_links(
                 notes_to_update.push(*sub_id);
                 linked += 1;
             } else {
-                println!(
-                    "No matching subscriber note for base note guid {}, skipping",
-                    base_guid
-                );
+                println!("No matching subscriber note for base note guid {base_guid}, skipping");
                 skipped.push(base_guid);
             }
         }

@@ -1,3 +1,11 @@
+// Casts convert field/template indices between usize/u32/i32; values are validated and in range.
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss
+)]
+
 use std::collections::{HashMap, HashSet};
 
 use crate::cleanser;
@@ -9,7 +17,6 @@ use crate::structs::{AnkiDeck, Note};
 use tracing::{error, warn};
 
 use async_recursion::async_recursion;
-use once_cell::sync::Lazy;
 use regex::Regex;
 use serde_json::json;
 use std::sync::Arc; // for constructing history payloads
@@ -31,15 +38,16 @@ pub mod history {
     }
 
     impl EventType {
-        pub fn as_str(&self) -> &'static str {
+        #[must_use]
+        pub const fn as_str(&self) -> &'static str {
             match self {
-                EventType::NoteCreated => "note_created",
-                EventType::FieldAdded => "field_added",
-                EventType::FieldUpdated => "field_updated",
-                EventType::FieldRemoved => "field_removed",
-                EventType::TagAdded => "tag_added",
-                EventType::TagRemoved => "tag_removed",
-                EventType::NoteMoved => "note_moved",
+                Self::NoteCreated => "note_created",
+                Self::FieldAdded => "field_added",
+                Self::FieldUpdated => "field_updated",
+                Self::FieldRemoved => "field_removed",
+                Self::TagAdded => "tag_added",
+                Self::TagRemoved => "tag_removed",
+                Self::NoteMoved => "note_moved",
             }
         }
     }
@@ -95,10 +103,7 @@ pub async fn validate_note_has_any_field(
     note_id: i64,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let row = tx
-        .query_opt(
-            "SELECT 1 FROM fields WHERE note = $1 LIMIT 1",
-            &[&note_id],
-        )
+        .query_opt("SELECT 1 FROM fields WHERE note = $1 LIMIT 1", &[&note_id])
         .await?;
     Ok(row.is_some())
 }
@@ -211,7 +216,7 @@ pub async fn is_valid_optional_tag(
     deck: &i64,
     tag: &str,
 ) -> std::result::Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    static OPTIONAL_TAG_RE: Lazy<Regex> = Lazy::new(|| {
+    static OPTIONAL_TAG_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
         Regex::new(r"AnkiCollab_Optional::(?P<tag_group>[^:]+)(::(?P<subtag>[^:]+))?").unwrap()
     });
 
@@ -448,7 +453,7 @@ async fn ensure_base_commit(
 ) -> Result<i32, Box<dyn std::error::Error + Send + Sync>> {
     // Create a commit and attach it to the base note's deck using the current connection
     let mut description = match source_deck_name {
-        Some(name) if !name.is_empty() => format!("Forwarded from subscriber deck: {}", name),
+        Some(name) if !name.is_empty() => format!("Forwarded from subscriber deck: {name}"),
         _ => "Forwarded from subscriber deck".to_string(),
     };
     if let Some(orig) = original_comment {
@@ -501,12 +506,13 @@ async fn ensure_base_commit(
     Ok(commit_id)
 }
 
+#[allow(clippy::too_many_arguments)] // TODO: refactor arguments into a struct
 async fn route_inherited_field_suggestions(
     client: &mut SharedConn,
     note: &Note,
     subscriber_note_id: i64,
     base_note_id: i64,
-    subscribed_fields: &Option<Vec<i32>>,
+    subscribed_fields: Option<&Vec<i32>>,
     req_ip: &str,
     local_commit: i32,
     base_commit: Option<i32>,
@@ -552,13 +558,13 @@ async fn route_inherited_field_suggestions(
         }
         if is_subscribed(pos) && base_commit.is_some() {
             // Only forward if changed from base reviewed content
-            if base_map.get(&upos).map(|v| v != &cleaned).unwrap_or(true) {
+            if base_map.get(&upos) != Some(&cleaned) {
                 base_pos.push(upos);
                 base_val.push(cleaned);
             }
         } else {
             // either not subscribed or base commit unavailable → keep local
-            if local_map.get(&upos).map(|v| v != &cleaned).unwrap_or(true) {
+            if local_map.get(&upos) != Some(&cleaned) {
                 local_pos.push(upos);
                 local_val.push(cleanser::clean(raw));
             }
@@ -659,7 +665,7 @@ async fn suggest_inherited_tags(
     if !additions.is_empty() {
         let deck_id = get_topmost_deck_by_note_id(&tx, subscriber_note_id).await?;
         let mut validated: Vec<String> = Vec::with_capacity(additions.len());
-        for t in additions.into_iter() {
+        for t in additions {
             if t.starts_with("AnkiCollab_Optional::") {
                 if is_valid_optional_tag(&tx, &deck_id, &t)
                     .await
@@ -682,7 +688,8 @@ async fn suggest_inherited_tags(
     tx.execute(
         "DELETE FROM tags WHERE note = $1 AND content = ANY($2::text[]) AND reviewed = true",
         &[&subscriber_note_id, &local_overlaps_vec],
-    ).await?;
+    )
+    .await?;
 
     // Base suppressions: base tags the user no longer wants effective
     let removals_base: HashSet<String> = base_set.difference(&desired_set).cloned().collect();
@@ -715,6 +722,7 @@ async fn suggest_inherited_tags(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)] // TODO: refactor arguments into a struct
 pub async fn overwrite_note(
     client: &mut SharedConn,
     note: &Note,
@@ -725,6 +733,8 @@ pub async fn overwrite_note(
     old_deck_id: i64,
     actor_user_id: Option<i32>,
 ) -> std::result::Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    use std::collections::HashMap; // local scope to avoid conflict with outer use
+
     // Validation: prevent wiping a note's content entirely
     if note.fields.is_empty() {
         return Err("At least one field is required".into());
@@ -751,7 +761,6 @@ pub async fn overwrite_note(
     let tx = client.transaction().await?;
 
     // Capture existing reviewed fields BEFORE overwrite (position -> content)
-    use std::collections::HashMap; // local scope to avoid conflict with outer use
     let existing_rows = tx
         .query(
             "SELECT position, content FROM fields WHERE note = $1 AND reviewed = true",
@@ -898,12 +907,18 @@ pub async fn overwrite_note(
     // Critical validation: ensure note still has at least one field before committing
     // This prevents data corruption where a note ends up with no fields
     if !validate_note_has_any_field(&tx, n_id).await? {
-        error!(note_id = n_id, "CRITICAL: overwrite_note would leave note with no fields - aborting");
+        error!(
+            note_id = n_id,
+            "CRITICAL: overwrite_note would leave note with no fields - aborting"
+        );
         sentry::capture_message(
-            &format!("overwrite_note would leave note {} with no fields", n_id),
+            &format!("overwrite_note would leave note {n_id} with no fields"),
             sentry::Level::Error,
         );
-        return Err(format!("Cannot overwrite note {}: operation would leave it with no fields", n_id).into());
+        return Err(format!(
+            "Cannot overwrite note {n_id}: operation would leave it with no fields"
+        )
+        .into());
     }
 
     tx.commit().await?;
@@ -919,7 +934,7 @@ pub async fn overwrite_note(
             },
             || {
                 sentry::capture_message(
-                    &format!("[BUG] Failed to update media references for note {}: {}", n_id, e),
+                    &format!("[BUG] Failed to update media references for note {n_id}: {e}"),
                     sentry::Level::Error,
                 );
             },
@@ -944,6 +959,7 @@ pub async fn overwrite_note(
     ))
 }
 
+#[allow(clippy::too_many_arguments)] // TODO: refactor arguments into a struct
 pub async fn update_note(
     client: &mut SharedConn,
     note: &Note,
@@ -1107,7 +1123,7 @@ pub async fn update_note(
             note,
             n_id,
             base_note_id,
-            &subscribed_fields,
+            subscribed_fields.as_ref(),
             req_ip,
             commit,
             base_commit_id,
@@ -1192,12 +1208,18 @@ pub async fn update_note(
         // Critical validation: ensure note still has at least one field before committing
         // This prevents data corruption where a note ends up with no fields
         if !validate_note_has_any_field(&tx, n_id).await? {
-            error!(note_id = n_id, "CRITICAL: update_note would leave note with no fields - aborting");
+            error!(
+                note_id = n_id,
+                "CRITICAL: update_note would leave note with no fields - aborting"
+            );
             sentry::capture_message(
-                &format!("update_note would leave note {} with no fields", n_id),
+                &format!("update_note would leave note {n_id} with no fields"),
                 sentry::Level::Error,
             );
-            return Err(format!("Cannot update note {}: operation would leave it with no fields", n_id).into());
+            return Err(format!(
+                "Cannot update note {n_id}: operation would leave it with no fields"
+            )
+            .into());
         }
 
         tx.commit().await?;
@@ -1300,6 +1322,7 @@ async fn get_id_from_path(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // TODO: refactor arguments into a struct
 #[async_recursion]
 async fn try_suggest_note(
     client: &mut SharedConn,
@@ -1354,8 +1377,8 @@ pub fn remove_ankicollab_suffix(
     raw_deck_path: &str,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     // Remove AnkiCollab suffix
-    static ANKICOLLAB_SUFFIX_RE: Lazy<Regex> =
-        Lazy::new(|| Regex::new(r"\s?\(AnkiCollab\)(_\d+)?").unwrap());
+    static ANKICOLLAB_SUFFIX_RE: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r"\s?\(AnkiCollab\)(_\d+)?").unwrap());
 
     let res = ANKICOLLAB_SUFFIX_RE.replace(raw_deck_path, "").into_owned();
     if res.is_empty() {
@@ -1462,10 +1485,7 @@ pub async fn sanity_check(
     deck_path: &str,
     commit: i32,
 ) -> Result<(Option<i64>, i32), Box<dyn std::error::Error + Send + Sync>> {
-    let mut deck_id = match get_id_from_path(client, deck_hash, deck_path).await {
-        Ok(id) => Some(id),
-        Err(_error) => None,
-    };
+    let mut deck_id = get_id_from_path(client, deck_hash, deck_path).await.ok();
 
     // Check if the parent exists and insert child if it does, else abort
     if deck_id.is_none() {
@@ -1490,7 +1510,7 @@ pub async fn sanity_check(
         match get_id_from_path(client, deck_hash, &parent_path).await {
             Ok(id) => deck_id = Some(id),
             Err(_error) => return Err("Parent Deck does not exist".into()),
-        };
+        }
 
         client
             .query(
@@ -1510,6 +1530,7 @@ pub async fn sanity_check(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // TODO: refactor arguments into a struct
 #[async_recursion]
 pub async fn make(
     client: &mut SharedConn,
@@ -1561,7 +1582,7 @@ pub async fn make(
         //     Ok(_res) => { },
         //     Err(error) => { println!("Error Submit Note: {error}") },
         // }; // Big Problem: Issues go unnoticed by the user.
-                
+
         try_suggest_note(
             client,
             deck_hash,

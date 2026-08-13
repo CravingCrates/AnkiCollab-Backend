@@ -1,3 +1,11 @@
+// Casts convert row-count values between u64/usize; values are validated and in range.
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss
+)]
+
 use crate::{database, structs::StatsInfo};
 
 use std::sync::Arc;
@@ -11,7 +19,7 @@ pub async fn new(
         Ok(pool) => pool,
         Err(err) => {
             sentry::capture_message(
-                &format!("stats::new: Failed to get pool: {}", err),
+                &format!("stats::new: Failed to get pool: {err}"),
                 sentry::Level::Error,
             );
             return Err("Failed to retrieve a pooled connection".into());
@@ -61,13 +69,10 @@ pub async fn new(
 
     if deck_ids.is_empty() {
         sentry::capture_message(
-            &format!(
-                "stats::new: No decks found for deck_id {} (should not happen)",
-                deck_id
-            ),
+            &format!("stats::new: No decks found for deck_id {deck_id} (should not happen)"),
             sentry::Level::Error,
         );
-        return Err(format!("No decks found for deck_id {}", deck_id).into());
+        return Err(format!("No decks found for deck_id {deck_id}").into());
     }
 
     // Collect all GUIDs and build a batch lookup

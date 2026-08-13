@@ -1,3 +1,11 @@
+// Casts convert token sizes between i64/u64; values are validated and in range.
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss
+)]
+
 use std::collections::hash_map::Entry;
 use std::sync::Arc;
 
@@ -27,7 +35,7 @@ const DOWNLOAD_TOKEN_MAX_REUSES: u8 = 3;
 const UPLOAD_TOKEN_MAX_REUSES: u8 = 6; // Allow extra client retries without tripping replay guard
 
 // CORS allowed origins (matches upload configuration)
-fn get_cors_origin() -> &'static str {
+const fn get_cors_origin() -> &'static str {
     "*"
 }
 
@@ -39,9 +47,9 @@ pub fn routes() -> Router<Arc<AppState>> {
 }
 
 // Start background task to clean up expired tokens from cache
-pub async fn start_token_cleanup_task(state: Arc<AppState>) {
+pub fn start_token_cleanup_task(state: Arc<AppState>) {
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(300)); // 5 minutes
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_mins(5)); // 5 minutes
 
         loop {
             interval.tick().await;
@@ -68,7 +76,7 @@ pub(crate) async fn download_media_file(
         .map_err(|e| match e {
             MediaTokenError::Expired => (StatusCode::UNAUTHORIZED, "Unauthorized".to_string()),
             other => {
-                let err_debug = format!("{:?}", other);
+                let err_debug = format!("{other:?}");
                 sentry::with_scope(
                     |scope| {
                         scope.set_fingerprint(Some(["download-token-invalid"].as_ref()));
@@ -79,8 +87,7 @@ pub(crate) async fn download_media_file(
                     || {
                         sentry::capture_message(
                             &format!(
-                                "Download token verification failed: hash={}, error={}",
-                                hash, err_debug
+                                "Download token verification failed: hash={hash}, error={err_debug}"
                             ),
                             sentry::Level::Warning,
                         );
@@ -166,15 +173,12 @@ pub(crate) async fn download_media_file(
                         ..Default::default()
                     }));
                     scope.set_extra("hash", hash.clone().into());
-                    scope.set_extra("error", format!("{:?}", err).into());
+                    scope.set_extra("error", format!("{err:?}").into());
                     scope.set_tag("operation", "download");
                 },
                 || {
                     sentry::capture_message(
-                        &format!(
-                            "Failed to build download response: hash={}, error={:?}",
-                            hash, err
-                        ),
+                        &format!("Failed to build download response: hash={hash}, error={err:?}"),
                         sentry::Level::Error,
                     );
                 },
@@ -205,15 +209,12 @@ pub(crate) async fn upload_media_file(
                     scope.set_fingerprint(Some(["upload-token-invalid"].as_ref()));
                     scope.set_extra("hash", hash.clone().into());
                     scope.set_extra("client_ip", client_ip.to_string().into());
-                    scope.set_extra("error", format!("{:?}", e).into());
+                    scope.set_extra("error", format!("{e:?}").into());
                     scope.set_tag("operation", "upload");
                 },
                 || {
                     sentry::capture_message(
-                        &format!(
-                            "Upload token verification failed: hash={}, error={:?}",
-                            hash, e
-                        ),
+                        &format!("Upload token verification failed: hash={hash}, error={e:?}"),
                         sentry::Level::Warning,
                     );
                 },
@@ -273,14 +274,13 @@ pub(crate) async fn upload_media_file(
                 scope.set_extra("filename_anon", anon_filename.clone().into());
                 scope.set_extra("file_extension", filename.rsplit('.').next().unwrap_or("").into());
                 scope.set_extra("expected_size", expected_size.into());
-                scope.set_extra("error", format!("{:?}", e).into());
+                scope.set_extra("error", format!("{e:?}").into());
                 scope.set_tag("operation", "upload");
             },
             || {
                 sentry::capture_message(
                     &format!(
-                        "Failed to read upload body: hash={}, file={}, expected_size={}, error={:?}",
-                        hash, anon_filename, expected_size, e
+                        "Failed to read upload body: hash={hash}, file={anon_filename}, expected_size={expected_size}, error={e:?}"
                     ),
                     sentry::Level::Error,
                 );
@@ -296,7 +296,7 @@ pub(crate) async fn upload_media_file(
         &state,
         media_bucket(),
         &s3_key,
-        expected_size as i64,
+        expected_size,
         content_type,
         md5_base64,
         body_bytes,
@@ -316,11 +316,11 @@ pub(crate) async fn upload_media_file(
                 StatusCode::NOT_FOUND,
                 "Storage bucket not found".to_string(),
             ),
-            S3OpError::Other(_, Some(500)) | S3OpError::Other(_, Some(503)) => (
+            S3OpError::Other(_, Some(500 | 503)) => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Storage service temporarily unavailable. Please retry later.".to_string(),
             ),
-            _ => (
+            S3OpError::Other(..) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Failed to store media file. Please try again.".to_string(),
             ),
@@ -332,7 +332,7 @@ pub(crate) async fn upload_media_file(
     // consume the token AFTER successful S3 upload - prevents token burning on S3 failures
     register_token_use(&state, &query.token, claims.exp, UPLOAD_TOKEN_MAX_REUSES)
         .await
-        .map_err(|e| {
+        .inspect_err(|_e| {
             sentry::with_scope(
                 |scope| {
                     scope.set_fingerprint(Some(["upload-token-replay"].as_ref()));
@@ -353,14 +353,12 @@ pub(crate) async fn upload_media_file(
                 || {
                     sentry::capture_message(
                         &format!(
-                            "Upload token replay detected: hash={}, file={}, user_id={}",
-                            hash, anon_filename, user_id
+                            "Upload token replay detected: hash={hash}, file={anon_filename}, user_id={user_id}"
                         ),
                         sentry::Level::Warning,
                     );
                 },
             );
-            e
         })?;
 
     // NOTE: We do NOT insert into media_files here to avoid race condition with cleanup_orphaned_media

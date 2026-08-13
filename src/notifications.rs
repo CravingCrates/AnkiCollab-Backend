@@ -1,3 +1,11 @@
+// Casts convert collection lengths between usize/i64; values are validated and in range.
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss
+)]
+
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
@@ -8,22 +16,22 @@ use crate::structs::{
     CommitTagChange, NotificationDeckGroup, NotificationHistoryResponse, NotificationItem,
     NotificationUnreadResponse,
 };
-use once_cell::sync::Lazy;
 use serde_json::Value as JsonValue;
 
 /// Strict sanitizer for diff HTML output. Only allows safe formatting and diff
 /// markup tags -- no scripts, iframes, event handlers, or dangerous elements.
-static DIFF_SANITIZER: Lazy<ammonia::Builder<'static>> = Lazy::new(|| {
-    let mut builder = ammonia::Builder::empty();
-    builder.add_tags(&[
-        "ins", "del", "span", "b", "i", "u", "em", "strong", "sub", "sup", "br", "p", "div", "img",
-        "ruby", "rt",
-    ]);
-    builder.add_generic_attributes(&["class"]);
-    builder.add_tag_attributes("img", &["src", "alt"]);
-    builder.add_tag_attributes("span", &["class"]);
-    builder
-});
+static DIFF_SANITIZER: std::sync::LazyLock<ammonia::Builder<'static>> =
+    std::sync::LazyLock::new(|| {
+        let mut builder = ammonia::Builder::empty();
+        builder.add_tags(&[
+            "ins", "del", "span", "b", "i", "u", "em", "strong", "sub", "sup", "br", "p", "div",
+            "img", "ruby", "rt",
+        ]);
+        builder.add_generic_attributes(&["class"]);
+        builder.add_tag_attributes("img", &["src", "alt"]);
+        builder.add_tag_attributes("span", &["class"]);
+        builder
+    });
 
 fn sanitize_diff_html(html: &str) -> String {
     DIFF_SANITIZER.clean(html).to_string()
@@ -198,7 +206,7 @@ pub async fn mark_read(state: &Arc<AppState>, user_id: i32, ids: &[i32]) -> Resu
     }
 
     if ids.len() > MAX_MARK_READ_IDS {
-        return Err(format!("Too many IDs (max {})", MAX_MARK_READ_IDS));
+        return Err(format!("Too many IDs (max {MAX_MARK_READ_IDS})"));
     }
 
     let client = state
@@ -323,13 +331,13 @@ pub async fn get_commit_snapshot(
         let reviewed: bool = row.get::<_, Option<bool>>(6).unwrap_or(false);
         let notetype_id: Option<i64> = row.get(7);
 
-        let old_text = summarize_event_text(&event_type, &old_value, true);
+        let old_text = summarize_event_text(&event_type, old_value.as_ref(), true);
         let new_side_value = if new_value.is_none()
             && (event_type == "field_change_denied" || event_type == "tag_change_denied")
         {
-            &old_value
+            old_value.as_ref()
         } else {
-            &new_value
+            new_value.as_ref()
         };
         let new_text = summarize_event_text(&event_type, new_side_value, false);
 
@@ -397,12 +405,12 @@ pub async fn get_commit_snapshot(
                 new_value
                     .as_ref()
                     .and_then(|v| v.get("action"))
-                    .and_then(|v| v.as_bool())
+                    .and_then(serde_json::Value::as_bool)
                     .or_else(|| {
                         old_value
                             .as_ref()
                             .and_then(|v| v.get("action"))
-                            .and_then(|v| v.as_bool())
+                            .and_then(serde_json::Value::as_bool)
                     })
                     .unwrap_or(true)
             } else {
@@ -492,7 +500,7 @@ pub async fn get_commit_snapshot(
 fn extract_position(value: &JsonValue) -> Option<i32> {
     value
         .get("position")
-        .and_then(|v| v.as_i64())
+        .and_then(serde_json::Value::as_i64)
         .and_then(|v| i32::try_from(v).ok())
 }
 
@@ -505,23 +513,23 @@ fn extract_field_content(value: &JsonValue) -> Option<&str> {
 
 fn summarize_event_text(
     event_type: &str,
-    value: &Option<JsonValue>,
+    value: Option<&JsonValue>,
     old_side: bool,
 ) -> Option<String> {
-    let json = value.as_ref()?;
+    let json = value?;
     match event_type {
         "field_added" | "field_removed" | "field_updated" => {
-            extract_field_content(json).map(|s| cleanser::clean(s))
+            extract_field_content(json).map(cleanser::clean)
         }
         "tag_added" | "tag_removed" => json
             .get("content")
             .and_then(|v| v.as_str())
-            .map(|s| format!("#{}", s)),
+            .map(|s| format!("#{s}")),
         "note_moved" => {
             let key = if old_side { "from" } else { "to" };
             json.get(key)
                 .and_then(|v| v.as_str())
-                .map(|s| cleanser::clean(s))
+                .map(cleanser::clean)
                 .filter(|s| !s.trim().is_empty())
                 .or_else(|| Some("deck updated".to_string()))
         }
@@ -535,23 +543,24 @@ fn summarize_event_text(
             } else {
                 "denied_content"
             };
-            json.get(key)
-                .and_then(|v| v.as_str())
-                .map(|s| cleanser::clean(s))
+            json.get(key).and_then(|v| v.as_str()).map(cleanser::clean)
         }
         "tag_change_denied" => {
             let content = json
                 .get("content")
                 .and_then(|v| v.as_str())
-                .map(|s| cleanser::clean(s))
+                .map(cleanser::clean)
                 .unwrap_or_default();
-            let action = json.get("action").and_then(|v| v.as_bool()).unwrap_or(true);
+            let action = json
+                .get("action")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true);
             if content.trim().is_empty() {
                 Some("tag change denied".to_string())
             } else if action {
-                Some(format!("Denied adding tag #{}", content))
+                Some(format!("Denied adding tag #{content}"))
             } else {
-                Some(format!("Denied removing tag #{}", content))
+                Some(format!("Denied removing tag #{content}"))
             }
         }
         _ => None,

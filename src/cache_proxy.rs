@@ -14,7 +14,6 @@ use serde::Deserialize;
 use tokio_util::io::ReaderStream;
 
 use crate::cache_manager::deck_cache_bucket;
-use crate::cache_tokens::CacheTokenError;
 use crate::database::AppState;
 use crate::s3_ops::{self, S3OpError};
 
@@ -31,10 +30,7 @@ async fn download_cache_object(
     let claims = state
         .cache_token_service
         .verify_token(&query.token)
-        .map_err(|err| match err {
-            CacheTokenError::Expired => (StatusCode::UNAUTHORIZED, "Unauthorized".to_string()),
-            _ => (StatusCode::UNAUTHORIZED, "Unauthorized".to_string()),
-        })?;
+        .map_err(|_| (StatusCode::UNAUTHORIZED, "Unauthorized".to_string()))?;
 
     register_token_use(&state, &query.token, claims.exp, CACHE_TOKEN_MAX_REUSES).await?;
 

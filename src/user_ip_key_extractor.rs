@@ -30,5 +30,4 @@ impl KeyExtractor for UserOrIpKeyExtractor {
         let ip = SmartIpKeyExtractor.extract(req)?;
         Ok(format!("ip:{ip}"))
     }
-
 }

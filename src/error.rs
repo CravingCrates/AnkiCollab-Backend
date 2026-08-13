@@ -10,6 +10,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
+#[must_use]
 pub fn hash_pii(data: &str) -> String {
     let mut hasher = DefaultHasher::new();
     data.hash(&mut hasher);
@@ -99,7 +100,7 @@ impl AppError {
 
     /// Override the status code
     #[must_use]
-    pub fn with_status(mut self, status: StatusCode) -> Self {
+    pub const fn with_status(mut self, status: StatusCode) -> Self {
         self.status = status;
         self
     }
@@ -127,11 +128,11 @@ impl AppError {
         sentry::with_scope(
             |scope| {
                 // Set fingerprint for grouping similar errors
-                scope.set_fingerprint(Some(&[self.operation, &self.status.as_str()]));
+                scope.set_fingerprint(Some(&[self.operation, self.status.as_str()]));
 
                 // Add context as extras
                 for (key, value) in &self.context {
-                    scope.set_extra(*key, value.clone().into());
+                    scope.set_extra(key, value.clone().into());
                 }
 
                 scope.set_tag("operation", self.operation);
@@ -156,7 +157,7 @@ impl AppError {
                 scope.set_fingerprint(Some(&[self.operation, "operational"]));
 
                 for (key, value) in &self.context {
-                    scope.set_extra(*key, value.clone().into());
+                    scope.set_extra(key, value.clone().into());
                 }
 
                 scope.set_tag("operation", self.operation);
@@ -250,13 +251,13 @@ impl AppError {
 
     /// Database connection failure (bug - infrastructure issue)
     pub fn db_connection(operation: &'static str, err: impl fmt::Display) -> Self {
-        Self::bug(operation, format!("Database connection failed: {}", err))
+        Self::bug(operation, format!("Database connection failed: {err}"))
             .with_message("Database temporarily unavailable. Please try again.")
     }
 
     /// Database query failure (bug - likely a code issue)
     pub fn db_query(operation: &'static str, err: impl fmt::Display) -> Self {
-        Self::bug(operation, format!("Database query failed: {}", err))
+        Self::bug(operation, format!("Database query failed: {err}"))
     }
 
     /// S3/storage failure (operational - external service issue)
@@ -269,11 +270,12 @@ impl AppError {
             StatusCode::SERVICE_UNAVAILABLE,
             operation,
             user_message,
-            format!("Storage error: {}", err),
+            format!("Storage error: {err}"),
         )
     }
 
     /// Rate limited (expected, not a bug)
+    #[must_use]
     pub fn rate_limited(operation: &'static str) -> Self {
         Self::expected(
             StatusCode::TOO_MANY_REQUESTS,
@@ -284,7 +286,7 @@ impl AppError {
 
     /// Internal processing error (bug)
     pub fn internal(operation: &'static str, err: impl fmt::Display) -> Self {
-        Self::bug(operation, format!("Internal error: {}", err))
+        Self::bug(operation, format!("Internal error: {err}"))
     }
 }
 

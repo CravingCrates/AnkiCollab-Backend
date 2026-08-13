@@ -19,7 +19,7 @@ impl S3Throttle {
         let spacing = if max_rps == 0 {
             Duration::from_secs(0)
         } else {
-            Duration::from_secs_f64(1.0 / max_rps as f64)
+            Duration::from_secs_f64(1.0 / f64::from(max_rps))
         };
 
         let mut interval = time::interval(spacing.max(Duration::from_millis(1)));

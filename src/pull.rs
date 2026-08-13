@@ -1,3 +1,11 @@
+// Casts convert note/field indices between usize/u32/i32; values are validated and in range.
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss
+)]
+
 use std::fmt::Write;
 use std::sync::Arc;
 
@@ -17,7 +25,7 @@ fn assemble_deck_tree(
     if let Some(child_ids) = child_map.get(&parent_id) {
         // Sort child IDs to ensure deterministic ordering
         let mut sorted_child_ids = child_ids.clone();
-        sorted_child_ids.sort();
+        sorted_child_ids.sort_unstable();
 
         sorted_child_ids
             .into_iter()
@@ -109,14 +117,14 @@ async fn create_deck_with_content(
     let notes = match get_changed_notes(client, deck_id, timestamp).await {
         Ok(n) => n,
         Err(e) => {
-            eprintln!("Error fetching changed notes for deck {}: {}", deck_id, e);
+            eprintln!("Error fetching changed notes for deck {deck_id}: {e}");
             return Err(e);
         }
     };
-    let notetypes = if !notes.is_empty() {
-        get_notetypes(client, &notes, owner).await
-    } else {
+    let notetypes = if notes.is_empty() {
         Vec::new()
+    } else {
+        get_notetypes(client, &notes, owner).await
     };
 
     Ok(AnkiDeck {
@@ -244,6 +252,8 @@ async fn get_changed_notes(
         // Fetch inheritance links for this batch
         let inh_rows = client.query(&inheritance_query, &[&note_ids]).await?;
 
+        #[allow(clippy::type_complexity)]
+        // This is a complex type, but it's necessary for the inheritance mapping
         let mut inheritance_map: HashMap<i64, (i64, Option<Vec<i32>>, Vec<String>)> =
             HashMap::new();
         let mut base_ids: Vec<i64> = Vec::new();
@@ -319,7 +329,7 @@ async fn get_changed_notes(
             if let Some(note_fields) = fields_map.get(&note_id) {
                 for (content, position) in note_fields {
                     if (*position as usize) < fields.len() {
-                        fields[*position as usize] = content.clone();
+                        fields[*position as usize].clone_from(content);
                     } else {
                         println!(
                             "Invalid field position: {position}; note_id: {note_id}; model id: {note_model_id}"
@@ -348,13 +358,12 @@ async fn get_changed_notes(
                 match subscribed_fields_opt {
                     None => {
                         // subscribe all
-                        for idx in 0..fields.len() {
+                        for (idx, field) in fields.iter_mut().enumerate() {
                             let pos = idx as u32;
-                            if let Some(val) = base_pos_map.get(&pos) {
-                                fields[idx] = val.clone();
-                            } else {
-                                // If no value found, clear the field
-                                fields[idx] = String::new();
+
+                            match base_pos_map.get(&pos) {
+                                Some(val) => field.clone_from(val),
+                                None => field.clear(),
                             }
                         }
                     }
@@ -365,7 +374,7 @@ async fn get_changed_notes(
                                 if idx < fields.len() {
                                     let pos = *ord as u32;
                                     if let Some(val) = base_pos_map.get(&pos) {
-                                        fields[idx] = val.clone();
+                                        fields[idx].clone_from(val);
                                     }
                                     // If no value found, clear the field
                                     else {
@@ -392,7 +401,7 @@ async fn get_changed_notes(
             }
 
             // Skip all-empty fields
-            if fields.iter().all(|f| f.is_empty()) {
+            if fields.iter().all(std::string::String::is_empty) {
                 continue;
             }
 
@@ -494,10 +503,10 @@ pub async fn pull_changes(
         changelog: get_changelog_info(&client, root_id, timestamp)
             .await
             .unwrap_or_else(|e| {
-                eprintln!("Failed to retrieve changelog info: {}", e);
+                eprintln!("Failed to retrieve changelog info: {e}");
                 String::new()
             }),
-        deck_hash: deck_hash.to_string(),
+        deck_hash: deck_hash.clone(),
         optional_tags,
         deleted_notes,
         stats_enabled,

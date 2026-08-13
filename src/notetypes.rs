@@ -1,3 +1,11 @@
+// Casts convert field/template indices between usize/u32; values are validated and in range.
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss
+)]
+
 use crate::{
     cleanser, database,
     structs::{
@@ -275,11 +283,11 @@ pub async fn does_notetype_exist(
         }
 
         let matching_fields = notetype.flds.iter().enumerate().all(|(i, field)| {
-            existing_notetype_fields.get(i).map_or(false, |existing| {
+            existing_notetype_fields.get(i).is_some_and(|existing| {
                 let id_match = field
                     .id
                     .zip(existing.get::<_, Option<i64>>(1))
-                    .map_or(false, |(a, b)| a != 0 && b != 0 && a == b);
+                    .is_some_and(|(a, b)| a != 0 && b != 0 && a == b);
                 let name_match = field.name == existing.get::<_, String>(0);
                 id_match || name_match
             })
@@ -290,19 +298,17 @@ pub async fn does_notetype_exist(
         }
 
         let matching_templates = notetype.tmpls.iter().enumerate().all(|(i, template)| {
-            existing_notetype_templates
-                .get(i)
-                .map_or(false, |existing| {
-                    let id_match = template
-                        .id
-                        .zip(existing.get::<_, Option<i64>>(4))
-                        .map_or(false, |(a, b)| a != 0 && b != 0 && a == b);
-                    let qfmt_match = template.qfmt == existing.get::<_, String>(0);
-                    let afmt_match = template.afmt == existing.get::<_, String>(1);
-                    let bqfmt_match = template.bqfmt == existing.get::<_, String>(2);
-                    let bafmt_match = template.bafmt == existing.get::<_, String>(3);
-                    id_match || (qfmt_match && afmt_match && bqfmt_match && bafmt_match)
-                })
+            existing_notetype_templates.get(i).is_some_and(|existing| {
+                let id_match = template
+                    .id
+                    .zip(existing.get::<_, Option<i64>>(4))
+                    .is_some_and(|(a, b)| a != 0 && b != 0 && a == b);
+                let qfmt_match = template.qfmt == existing.get::<_, String>(0);
+                let afmt_match = template.afmt == existing.get::<_, String>(1);
+                let bqfmt_match = template.bqfmt == existing.get::<_, String>(2);
+                let bafmt_match = template.bafmt == existing.get::<_, String>(3);
+                id_match || (qfmt_match && afmt_match && bqfmt_match && bafmt_match)
+            })
         });
 
         // Try to find a notetype that is exactly the same, (Best case)
@@ -314,16 +320,14 @@ pub async fn does_notetype_exist(
         if notetype.name.to_lowercase().contains("projektanki") {
             let dirty_matching_templates =
                 notetype.tmpls.iter().enumerate().all(|(i, template)| {
-                    existing_notetype_templates
-                        .get(i)
-                        .map_or(false, |existing| {
-                            let id_match = template
-                                .id
-                                .zip(existing.get::<_, Option<i64>>(4))
-                                .map_or(false, |(a, b)| a != 0 && b != 0 && a == b);
-                            let name_match = template.name == existing.get::<_, String>(5);
-                            id_match || name_match
-                        })
+                    existing_notetype_templates.get(i).is_some_and(|existing| {
+                        let id_match = template
+                            .id
+                            .zip(existing.get::<_, Option<i64>>(4))
+                            .is_some_and(|(a, b)| a != 0 && b != 0 && a == b);
+                        let name_match = template.name == existing.get::<_, String>(5);
+                        id_match || name_match
+                    })
                 });
             if matching_fields && dirty_matching_templates {
                 return Ok(existing_notetype_guid);

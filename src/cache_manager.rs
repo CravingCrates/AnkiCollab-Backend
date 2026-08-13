@@ -1,28 +1,28 @@
 use serde_json::Value;
 
-use once_cell::sync::Lazy;
 use std::{env, time::Duration};
 
 use crate::cache_tokens::CacheTokenParams;
 use crate::database::AppState;
 use crate::s3_ops;
 
-static DECK_CACHE_BUCKET: Lazy<String> =
-    Lazy::new(|| std::env::var("S3_BUCKET_NAME").expect("S3_BUCKET_NAME must be set"));
+static DECK_CACHE_BUCKET: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    std::env::var("S3_BUCKET_NAME").expect("S3_BUCKET_NAME must be set")
+});
 
-static DECK_CACHE_PREFIX: Lazy<String> =
-    Lazy::new(|| env::var("DECK_CACHE_PREFIX").unwrap_or_else(|_| "decks".to_string()));
+static DECK_CACHE_PREFIX: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    env::var("DECK_CACHE_PREFIX").unwrap_or_else(|_| "decks".to_string())
+});
 
-static DECK_CACHE_MAGIC_TIMESTAMP: Lazy<String> = Lazy::new(|| {
+static DECK_CACHE_MAGIC_TIMESTAMP: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     env::var("DECK_CACHE_MAGIC_TIMESTAMP").unwrap_or_else(|_| "2022-12-31 23:59:59".to_string())
 });
 
-static DECK_CACHE_PRESIGNED_TTL: Lazy<Duration> = Lazy::new(|| {
+static DECK_CACHE_PRESIGNED_TTL: std::sync::LazyLock<Duration> = std::sync::LazyLock::new(|| {
     env::var("DECK_CACHE_PRESIGNED_TTL_SECS")
         .ok()
         .and_then(|raw| raw.parse::<u64>().ok())
-        .map(Duration::from_secs)
-        .unwrap_or_else(|| Duration::from_secs(900))
+        .map_or_else(|| Duration::from_mins(15), Duration::from_secs)
 });
 
 pub(crate) fn deck_cache_bucket() -> &'static str {
@@ -41,6 +41,7 @@ pub fn is_cache_bootstrap_timestamp(timestamp: &str) -> bool {
     timestamp == DECK_CACHE_MAGIC_TIMESTAMP.as_str()
 }
 
+#[must_use]
 pub fn deck_cache_pointer_key(deck_hash: &str) -> String {
     let mut key = String::new();
     let prefix = deck_cache_prefix().trim_end_matches('/');
@@ -136,8 +137,7 @@ pub async fn fetch_cache_bootstrap_response(
                                 let normalized_archive_key =
                                     raw_archive_key.trim_start_matches('/').to_string();
 
-                                if cache_key_is_scoped_to_deck(deck_hash, &normalized_archive_key)
-                                {
+                                if cache_key_is_scoped_to_deck(deck_hash, &normalized_archive_key) {
                                     archive_key_from_manifest = Some(normalized_archive_key);
                                 } else {
                                     sentry::add_breadcrumb(sentry::Breadcrumb {
@@ -190,7 +190,7 @@ pub async fn fetch_cache_bootstrap_response(
 
         match state.cache_token_service.generate_token(CacheTokenParams {
             deck_hash: deck_hash.to_string(),
-            s3_key: key.to_string(),
+            s3_key: key.clone(),
             content_type: Some(content_type.to_string()),
         }) {
             Ok(token) => Some(format!(

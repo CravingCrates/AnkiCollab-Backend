@@ -80,7 +80,7 @@ impl FromRequestParts<Arc<database::AppState>> for AuthenticatedUser {
             return Err((StatusCode::UNAUTHORIZED, "Invalid token".to_string()));
         }
 
-        Ok(AuthenticatedUser { user_id })
+        Ok(Self { user_id })
     }
 }
 
@@ -108,7 +108,7 @@ impl OptionalFromRequestParts<Arc<database::AppState>> for AuthenticatedUser {
         }
 
         match get_user_from_token(state, &token).await {
-            Ok(user_id) if user_id > 0 => Ok(Some(AuthenticatedUser { user_id })),
+            Ok(user_id) if user_id > 0 => Ok(Some(Self { user_id })),
             _ => Ok(None),
         }
     }
@@ -344,7 +344,7 @@ pub async fn get_username_from_token(
 
     let rows = client
         .query(
-            r#"
+            r"
             WITH updated AS (
                 UPDATE auth_tokens
                 SET last_used_at = NOW()
@@ -355,7 +355,7 @@ pub async fn get_username_from_token(
             SELECT users.username
             FROM users
             JOIN updated ON users.id = updated.user_id
-            "#,
+            ",
             &[&token_hash],
         )
         .await?;
@@ -448,7 +448,7 @@ pub async fn cleanup_expired_tokens(
 
 // ── Helper functions for the new extractor-based auth ─────────────────
 
-/// Get username by user ID (used after AuthenticatedUser extraction)
+/// Get username by user ID (used after `AuthenticatedUser` extraction)
 pub async fn get_username_by_user_id(
     db_state: &Arc<database::AppState>,
     user_id: i32,
@@ -460,8 +460,8 @@ pub async fn get_username_by_user_id(
     Ok(row.get(0))
 }
 
-/// Check if a user (by ID) is an owner or maintainer of a deck (by human_hash).
-/// Equivalent to `is_valid_user_token` but works with user_id directly,
+/// Check if a user (by ID) is an owner or maintainer of a deck (by `human_hash`).
+/// Equivalent to `is_valid_user_token` but works with `user_id` directly,
 /// avoiding a redundant token lookup.
 pub async fn is_deck_owner_or_maintainer(
     db_state: &Arc<database::AppState>,
@@ -504,7 +504,7 @@ pub async fn is_deck_owner_or_maintainer(
     Ok(!rows.is_empty())
 }
 
-/// Remove all auth tokens for a user (used with AuthenticatedUser extractor)
+/// Remove all auth tokens for a user (used with `AuthenticatedUser` extractor)
 pub async fn remove_token_by_user_id(
     db_state: &Arc<database::AppState>,
     user_id: i32,

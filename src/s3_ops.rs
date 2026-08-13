@@ -1,3 +1,11 @@
+// Casts convert retry attempt counters between usize/u32; values are small and in range.
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss
+)]
+
 use std::time::Duration;
 
 use crate::s3_throttle::S3Throttle;
@@ -60,7 +68,7 @@ where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = Result<T, SdkError<E>>>,
 {
-    call_with_retry_with_throttle(&*state.s3_throttle, make_call).await
+    call_with_retry_with_throttle(&state.s3_throttle, make_call).await
 }
 
 async fn call_with_retry_with_throttle<T, E, F, Fut>(
@@ -92,7 +100,6 @@ where
                             _ => exp_backoff,
                         };
                         sleep(delay).await;
-                        continue;
                     }
                     Some(404) => return Err(S3OpError::NotFound),
                     Some(403) => return Err(S3OpError::Forbidden),
@@ -110,9 +117,7 @@ fn log_s3_error(op: &str, bucket: &str, key_or_prefix: Option<&str>, err: &S3OpE
         return;
     }
 
-    let location = key_or_prefix
-        .map(|k| format!("{bucket}/{k}"))
-        .unwrap_or_else(|| bucket.to_string());
+    let location = key_or_prefix.map_or_else(|| bucket.to_string(), |k| format!("{bucket}/{k}"));
     let breadcrumb_message = format!("s3_ops {op} failed for {location}: {err:?}");
 
     // Capture messages without the specific key so Sentry groups them together.
@@ -126,7 +131,7 @@ fn log_s3_error(op: &str, bucket: &str, key_or_prefix: Option<&str>, err: &S3OpE
 
     sentry::add_breadcrumb(sentry::Breadcrumb {
         category: Some("s3_ops".into()),
-        message: Some(breadcrumb_message.clone()),
+        message: Some(breadcrumb_message),
         level: Level::Warning,
         ..Default::default()
     });

@@ -11,7 +11,7 @@ pub async fn add(
         Ok(pool) => pool,
         Err(err) => {
             sentry::capture_message(
-                &format!("subscription::add: Failed to get pool: {}", err),
+                &format!("subscription::add: Failed to get pool: {err}"),
                 sentry::Level::Error,
             );
             return Err("Failed to retrieve a pooled connection".into());
@@ -33,7 +33,7 @@ pub async fn add(
         .await;
     if let Err(err) = result {
         sentry::capture_message(
-            &format!("subscription::add: Failed to insert: {}", err),
+            &format!("subscription::add: Failed to insert: {err}"),
             sentry::Level::Error,
         );
         return Err("Cannot add the sub".into());
@@ -50,7 +50,7 @@ pub async fn remove(
         Ok(pool) => pool,
         Err(err) => {
             sentry::capture_message(
-                &format!("subscription::remove: Failed to get pool: {}", err),
+                &format!("subscription::remove: Failed to get pool: {err}"),
                 sentry::Level::Error,
             );
             return Err("Failed to retrieve a pooled connection".into());
@@ -72,7 +72,7 @@ pub async fn remove(
         .await;
     if let Err(err) = result {
         sentry::capture_message(
-            &format!("subscription::remove: Failed to delete: {}", err),
+            &format!("subscription::remove: Failed to delete: {err}"),
             sentry::Level::Error,
         );
         return Err("Cannot remove the sub".into());

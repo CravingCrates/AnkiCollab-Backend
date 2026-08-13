@@ -1,3 +1,11 @@
+// Casts convert field indices between usize/u32/i32; values are validated and in range.
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss
+)]
+
 use crate::database;
 use crate::human_hash::humanize;
 use uuid::Uuid;
@@ -222,10 +230,9 @@ pub async fn unpack_notes(
                 None => continue, // Note failed to insert (invalid notetype), skip its fields/tags
             };
 
-            let protected_fields = protected_fields_cache
+            let protected_fields: &[u32] = protected_fields_cache
                 .get(notetype_guid)
-                .map(|v| v.as_slice())
-                .unwrap_or(&[]);
+                .map_or(&[], std::vec::Vec::as_slice);
             let max_allowed_position = *max_field_cache.get(notetype_guid).unwrap_or(&0);
 
             // Truncate fields to match notetype constraints (preserving original logic)
@@ -274,7 +281,7 @@ pub async fn unpack_notes(
         let notes_without_fields: Vec<i64> = note_id_map
             .values()
             .filter(|&&id| !notes_with_fields.contains(&id))
-            .cloned()
+            .copied()
             .collect();
 
         if !notes_without_fields.is_empty() {
@@ -415,6 +422,7 @@ pub async fn unpack_notes(
     Ok("Success".to_string())
 }
 
+#[allow(clippy::too_many_arguments)] // TODO: refactor arguments into a struct
 pub async fn handle_notes_and_media_update(
     client: &mut SharedConn,
     deck: &AnkiDeck,
@@ -539,6 +547,7 @@ pub async fn handle_notes_and_media_update(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)] // TODO: refactor arguments into a struct
 #[async_recursion]
 pub async fn unpack_deck_data(
     client: &mut SharedConn,
@@ -592,7 +601,7 @@ pub async fn check_deck_exists(
     let my_uuid = Uuid::parse_str(deck_uuid)?;
     let hum = humanize(&my_uuid, 5);
     // Normalize deck name to match how we insert (cleaned), so the pre-check is consistent
-    let cleaned_deck_name = cleanser::clean(deck_name).to_string();
+    let cleaned_deck_name = cleanser::clean(deck_name).clone();
 
     if cleaned_deck_name.is_empty() {
         return Err("Deck name is empty. Please provide a valid name.".into());
@@ -607,14 +616,13 @@ pub async fn check_deck_exists(
     match deck_exist_check.first() {
         None => Ok(hum),
         Some(_row) => Err(format!(
-            "Deck {} already exists. Please submit suggestions instead.",
-            &deck_name
+            "Deck {deck_name} already exists. Please submit suggestions instead."
         )
         .into()),
     }
 }
 
-/// Create the root deck row synchronously and return (deck_id, human_hash).
+/// Create the root deck row synchronously and return (`deck_id`, `human_hash`).
 /// This reserves the final deck hash before background processing starts,
 /// avoiding mismatches in the initial response.
 pub async fn create_root_deck(
@@ -624,8 +632,8 @@ pub async fn create_root_deck(
     req_ip: &String,
     commit: i32,
 ) -> Result<(i64, String), Box<dyn std::error::Error + Send + Sync>> {
-    let cleaned_deck_name = cleanser::clean(&deck.name).to_string();
-    let cleaned_deck_desc = cleanser::clean(&deck.desc).to_string();
+    let cleaned_deck_name = cleanser::clean(&deck.name).clone();
+    let cleaned_deck_desc = cleanser::clean(&deck.desc).clone();
 
     if cleaned_deck_name.is_empty() {
         return Err("Deck name is empty. Please provide a valid name.".into());
@@ -642,10 +650,10 @@ pub async fn create_root_deck(
         )
         .await?;
 
-    if deck_exist_check.first().is_some() {
+    if !deck_exist_check.is_empty() {
         return Err(format!(
             "Deck {} already exists. Please submit suggestions instead.",
-            &deck.name
+            deck.name
         )
         .into());
     }
@@ -653,13 +661,12 @@ pub async fn create_root_deck(
     // Prepare initial UUID/human hash
     let mut use_uuid = deck.crowdanki_uuid.clone();
     // If provided UUID is invalid, generate a fresh one
-    let mut use_hum = match Uuid::parse_str(&use_uuid) {
-        Ok(u) => humanize(&u, 5),
-        Err(_) => {
-            let new_uuid = Uuid::new_v4();
-            use_uuid = new_uuid.to_string();
-            humanize(&new_uuid, 5)
-        }
+    let mut use_hum = if let Ok(u) = Uuid::parse_str(&use_uuid) {
+        humanize(&u, 5)
+    } else {
+        let new_uuid = Uuid::new_v4();
+        use_uuid = new_uuid.to_string();
+        humanize(&new_uuid, 5)
     };
 
     let stmt = client
@@ -693,8 +700,7 @@ pub async fn create_root_deck(
         Err(e) => {
             let is_unique = e
                 .as_db_error()
-                .map(|d| d.code() == &tokio_postgres::error::SqlState::UNIQUE_VIOLATION)
-                .unwrap_or(false);
+                .is_some_and(|d| d.code() == &tokio_postgres::error::SqlState::UNIQUE_VIOLATION);
             if !is_unique {
                 return Err(e.into());
             }
@@ -731,6 +737,7 @@ pub async fn create_root_deck(
     Ok((id, use_hum))
 }
 
+#[allow(clippy::too_many_arguments)] // TODO: refactor arguments into a struct
 #[async_recursion]
 pub async fn unpack_deck_json(
     client: &mut SharedConn,
@@ -753,13 +760,13 @@ pub async fn unpack_deck_json(
         RETURNING id
     ").await?;
 
-    let cleaned_deck_name = cleanser::clean(&deck.name).to_string();
+    let cleaned_deck_name = cleanser::clean(&deck.name).clone();
 
     if cleaned_deck_name.is_empty() {
         return Err("Deck name is empty. Please provide a valid name.".into());
     }
 
-    let cleaned_deck_desc = cleanser::clean(&deck.desc).to_string();
+    let cleaned_deck_desc = cleanser::clean(&deck.desc).clone();
     // Attempt insert; on unique violation (crowdanki_uuid/human_hash), retry once with a new UUID/human_hash.
     let mut use_uuid = deck.crowdanki_uuid.clone();
     let mut use_hum = hum.clone();
@@ -782,8 +789,7 @@ pub async fn unpack_deck_json(
         Err(e) => {
             let is_unique = e
                 .as_db_error()
-                .map(|d| d.code() == &tokio_postgres::error::SqlState::UNIQUE_VIOLATION)
-                .unwrap_or(false);
+                .is_some_and(|d| d.code() == &tokio_postgres::error::SqlState::UNIQUE_VIOLATION);
             if !is_unique {
                 return Err(e.into());
             }
@@ -855,17 +861,17 @@ pub async fn unpack_deck_json(
                 |scope| {
                     scope.set_fingerprint(Some(&["unpack_deck_data", "failure"]));
                     scope.set_tag("operation", "unpack_deck_data");
-                    scope.set_extra("deck_id", format!("{:?}", id).into());
+                    scope.set_extra("deck_id", format!("{id:?}").into());
                     scope.set_extra("commit_id", commit.into());
-                    scope.set_extra("error_chain", format!("{:#}", err).into());
-                    scope.set_extra("deck_params", deck_params.clone().into());
+                    scope.set_extra("error_chain", format!("{err:#}").into());
+                    scope.set_extra("deck_params", deck_params.clone());
                     if let Some(db) = db_details {
-                        scope.set_extra("db_error", db.into());
+                        scope.set_extra("db_error", db);
                     }
                 },
                 || {
                     sentry::capture_message(
-                        &format!("[unpack_deck_data] Deck unpacking failed: {}", err),
+                        &format!("[unpack_deck_data] Deck unpacking failed: {err}"),
                         sentry::Level::Error,
                     );
                 },

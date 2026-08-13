@@ -1,3 +1,11 @@
+// Casts convert storage/usage counters between i64/u64/u32/f64; values are validated and in range.
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss
+)]
+
 use axum::http::StatusCode;
 use chrono::{DateTime, Datelike, Utc};
 use std::collections::HashMap;
@@ -267,7 +275,7 @@ impl RateLimiter {
                     },
                     || {
                         sentry::capture_message(
-                            &format!("[load_user_quotas] Database connection failed: {}", err),
+                            &format!("[load_user_quotas] Database connection failed: {err}"),
                             sentry::Level::Error,
                         );
                     },
@@ -316,7 +324,7 @@ impl RateLimiter {
         let operation_count = self.operation_count.clone();
         let operation_reset_time = self.operation_reset_time.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(3600)); // Every hour
+            let mut interval = tokio::time::interval(Duration::from_hours(1)); // Every hour
             loop {
                 interval.tick().await;
 
@@ -359,7 +367,7 @@ impl RateLimiter {
         // Periodic saving to db
         let rate_limiter = self.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(600)); // Every 10 minutes
+            let mut interval = tokio::time::interval(Duration::from_mins(10)); // Every 10 minutes
             loop {
                 interval.tick().await;
 
@@ -374,10 +382,7 @@ impl RateLimiter {
                                 },
                                 || {
                                     sentry::capture_message(
-                                        &format!(
-                                            "[persist_user_quotas] Failed to persist: {}",
-                                            err
-                                        ),
+                                        &format!("[persist_user_quotas] Failed to persist: {err}"),
                                         sentry::Level::Error,
                                     );
                                 },
@@ -393,8 +398,7 @@ impl RateLimiter {
                             || {
                                 sentry::capture_message(
                                     &format!(
-                                        "[persist_user_quotas] Database connection failed: {}",
-                                        err
+                                        "[persist_user_quotas] Database connection failed: {err}"
                                     ),
                                     sentry::Level::Error,
                                 );
