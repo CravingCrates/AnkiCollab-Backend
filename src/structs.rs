@@ -396,6 +396,22 @@ pub struct CommitSnapshotEvent {
 }
 
 #[derive(Debug, Serialize)]
+pub struct CommitDeniedNoteField {
+    pub position: i32,
+    pub name: String,
+    pub content: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CommitDeniedNote {
+    pub note_id: i64,
+    pub notetype: i64,
+    pub guid: Option<String>,
+    pub fields: Vec<CommitDeniedNoteField>,
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
 pub struct CommitSnapshotResponse {
     pub commit_id: i32,
     pub rationale: i32,
@@ -407,6 +423,7 @@ pub struct CommitSnapshotResponse {
     pub tag_changes: Vec<CommitTagChange>,
     pub deleted_note_ids: Vec<i64>,
     pub move_changes: Vec<CommitMoveChange>,
+    pub denied_notes: Vec<CommitDeniedNote>,
     pub events: Vec<CommitSnapshotEvent>,
     pub decision_status: Option<String>,
     pub decision_reason: Option<String>,

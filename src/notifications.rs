@@ -12,9 +12,9 @@ use std::sync::Arc;
 use crate::cleanser;
 use crate::database::AppState;
 use crate::structs::{
-    CommitFieldChange, CommitMoveChange, CommitSnapshotEvent, CommitSnapshotResponse,
-    CommitTagChange, NotificationDeckGroup, NotificationHistoryResponse, NotificationItem,
-    NotificationUnreadResponse,
+    CommitDeniedNote, CommitDeniedNoteField, CommitFieldChange, CommitMoveChange,
+    CommitSnapshotEvent, CommitSnapshotResponse, CommitTagChange, NotificationDeckGroup,
+    NotificationHistoryResponse, NotificationItem, NotificationUnreadResponse,
 };
 use serde_json::Value as JsonValue;
 
@@ -323,6 +323,7 @@ pub async fn get_commit_snapshot(
     let mut tag_changes: Vec<CommitTagChange> = Vec::new();
     let mut deleted_note_ids: HashSet<i64> = HashSet::new();
     let mut move_changes: Vec<CommitMoveChange> = Vec::new();
+    let mut denied_notes: Vec<CommitDeniedNote> = Vec::new();
 
     for row in event_rows {
         let event_type: String = row.get(2);
@@ -330,6 +331,15 @@ pub async fn get_commit_snapshot(
         let new_value: Option<JsonValue> = row.get(4);
         let reviewed: bool = row.get::<_, Option<bool>>(6).unwrap_or(false);
         let notetype_id: Option<i64> = row.get(7);
+
+        // Denied new notes are stored with note_id = NULL; parse them from the
+        // JSON snapshot and return them separately (not as CommitSnapshotEvent).
+        if event_type == "note_denied" {
+            if let Some(json) = old_value.as_ref() {
+                denied_notes.push(parse_denied_note(json));
+            }
+            continue;
+        }
 
         let old_text = summarize_event_text(&event_type, old_value.as_ref(), true);
         let new_side_value = if new_value.is_none()
@@ -491,6 +501,7 @@ pub async fn get_commit_snapshot(
         tag_changes,
         deleted_note_ids: deleted_note_ids.into_iter().collect(),
         move_changes,
+        denied_notes,
         events,
         decision_status,
         decision_reason,
@@ -564,5 +575,61 @@ fn summarize_event_text(
             }
         }
         _ => None,
+    }
+}
+
+fn parse_denied_note(json: &JsonValue) -> CommitDeniedNote {
+    let note_id = json
+        .get("note_id")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    let notetype = json
+        .get("notetype")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    let guid = json
+        .get("guid")
+        .and_then(serde_json::Value::as_str)
+        .map(std::string::ToString::to_string);
+    let fields = json
+        .get("fields")
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .map(|f| CommitDeniedNoteField {
+                    position: f
+                        .get("position")
+                        .and_then(serde_json::Value::as_i64)
+                        .and_then(|v| i32::try_from(v).ok())
+                        .unwrap_or(0),
+                    name: f
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    content: f
+                        .get("content")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let tags = json
+        .get("tags")
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|t| t.as_str().map(std::string::ToString::to_string))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    CommitDeniedNote {
+        note_id,
+        notetype,
+        guid,
+        fields,
+        tags,
     }
 }

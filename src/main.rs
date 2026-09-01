@@ -1503,7 +1503,11 @@ async fn resolve_note_for_review(
         .unwrap_or_else(|_| "https://www.ankicollab.com".to_string());
     let redirect_url = format!("{base_url}/review/{note_id}");
 
-    axum::response::Redirect::to(&redirect_url).into_response()
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"url": redirect_url})),
+    )
+        .into_response()
 }
 
 fn media_routes() -> Router<Arc<AppState>> {
@@ -2024,7 +2028,7 @@ async fn main() {
             "/GetProtectedFields/{deck_hash}",
             get(get_protected_fields_from_deck),
         )
-        .route("/resolveNoteForReview", post(resolve_note_for_review))
+        .route("/ResolveNoteReview", post(resolve_note_for_review))
         .layer(GovernorLayer::new(standard_governor_conf));
 
     let auth_routes = Router::new()
