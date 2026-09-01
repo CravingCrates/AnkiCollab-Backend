@@ -740,7 +740,7 @@ ALTER TABLE anki.media_references ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTI
 
 CREATE TABLE anki.note_events (
     id bigint NOT NULL,
-    note_id bigint NOT NULL,
+    note_id bigint,
     version bigint NOT NULL,
     event_type text NOT NULL,
     actor_user_id integer,
