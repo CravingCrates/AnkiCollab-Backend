@@ -1549,7 +1549,7 @@ fn media_routes() -> Router<Arc<AppState>> {
     base_router.layer(GovernorLayer::new(media_governor_conf))
 }
 
-const DEFAULT_BUCKET_SIZE_BYTES: u64 = 50 * 1024 * 1024 * 1024; // 50 GB
+const DEFAULT_BUCKET_SIZE_BYTES: u64 = 0;
 
 async fn get_bucket_size(s3_client: &S3Client, s3_throttle: &S3Throttle, bucket: &str) -> u64 {
     let mut total_bytes: u64 = 0;
@@ -2134,9 +2134,12 @@ async fn main() {
     //.layer(ClientIpSource::ConnectInfo.into_extension());
 
     // run it
-    let listener = tokio::net::TcpListener::bind("localhost:5555")
-        .await
-        .unwrap();
+    let listener = tokio::net::TcpListener::bind(
+        std::env::var("BIND_ADDRESS")
+            .unwrap_or_else(|_| "localhost:5555".to_string()),
+    )
+    .await
+    .unwrap();
     println!("listening on {}", listener.local_addr().unwrap());
     axum::serve(
         listener,
