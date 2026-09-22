@@ -2135,8 +2135,7 @@ async fn main() {
 
     // run it
     let listener = tokio::net::TcpListener::bind(
-        std::env::var("BIND_ADDRESS")
-            .unwrap_or_else(|_| "localhost:5555".to_string()),
+        std::env::var("BIND_ADDRESS").unwrap_or_else(|_| "localhost:5555".to_string()),
     )
     .await
     .unwrap();
