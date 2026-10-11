@@ -1322,6 +1322,7 @@ async fn get_id_from_path(
     }
 }
 
+#[allow(clippy::double_must_use)]
 #[allow(clippy::too_many_arguments)] // TODO: refactor arguments into a struct
 #[async_recursion]
 async fn try_suggest_note(
@@ -1387,6 +1388,7 @@ pub fn remove_ankicollab_suffix(
     Ok(res)
 }
 
+#[allow(clippy::double_must_use)]
 #[async_recursion]
 pub async fn update_deck_names(deck: &mut AnkiDeck) {
     deck.name = match remove_ankicollab_suffix(&deck.name) {
@@ -1437,6 +1439,7 @@ pub async fn create_new_commit(
     Ok(rows[0].get(0))
 }
 
+#[allow(clippy::double_must_use)]
 #[async_recursion]
 pub async fn sanity_check_notetypes(
     client: &SharedConn,
@@ -1530,6 +1533,7 @@ pub async fn sanity_check(
     }
 }
 
+#[allow(clippy::double_must_use)]
 #[allow(clippy::too_many_arguments)] // TODO: refactor arguments into a struct
 #[async_recursion]
 pub async fn make(

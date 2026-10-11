@@ -80,22 +80,9 @@ pub struct AnkiDeck {
     pub notes: Vec<Note>,
 }
 
-impl AnkiDeck {
-    pub fn from_json_string(json_string: &str) -> Result<Self, serde_json::Error> {
-        serde_json::from_str(json_string)
-    }
-}
-
 #[derive(Deserialize, Serialize)]
 pub struct UpdateInfo {
     pub timestamp: String,
-}
-
-pub struct DeckUpdateInfo {
-    pub deck_id: u64,
-    pub deck_guid: String,
-    pub deck_update: chrono::NaiveDateTime,
-    pub parent: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -177,11 +164,6 @@ type DeckReview = HashMap<String, NoteReview>; // HashMap<DeckName, NoteReview>
 pub struct StatsInfo {
     pub deck_hash: String,
     pub review_history: DeckReview,
-}
-
-#[derive(Deserialize)]
-pub struct DeckHashOnly {
-    pub deck_hash: String,
 }
 
 #[derive(Deserialize)]
@@ -427,4 +409,77 @@ pub struct CommitSnapshotResponse {
     pub events: Vec<CommitSnapshotEvent>,
     pub decision_status: Option<String>,
     pub decision_reason: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ImpactCounts {
+    pub submitted: i64,
+    pub accepted: i64,
+    pub declined: i64,
+    pub pending: i64,
+    /// Reviewed with no recorded verdict: per-field/per-tag reviews write no notifications row.
+    pub unrecorded: i64,
+    pub reviewed: i64,
+    /// `None` below `MIN_REVIEWED_FOR_RATE` reviewed suggestions.
+    pub acceptance_rate: Option<f64>,
+    pub reach: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ImpactTotals {
+    pub submitted: i64,
+    pub accepted: i64,
+    pub declined: i64,
+    pub pending: i64,
+    pub unrecorded: i64,
+    pub reviewed: i64,
+    pub acceptance_rate: Option<f64>,
+    pub reach: i64,
+    pub decks_contributed_to: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ImpactMilestone {
+    pub accepted: i64,
+    pub current: Option<crate::contribution_stats::MilestoneTier>,
+    pub next: Option<crate::contribution_stats::MilestoneTier>,
+    pub progress_to_next: Option<f64>,
+    pub remaining_to_next: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ImpactLatestAccepted {
+    pub deck_name: String,
+    pub commit_id: i32,
+    pub accepted_at: String,
+    /// The maintainer who decided; `None` for decisions made before `actor_user_id` existed.
+    pub accepted_by: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ImpactDeckCommunity {
+    pub subscribers: i64,
+    pub net_subscribers_30d: Option<i64>,
+    pub accepted_30d: i64,
+    pub tracking_since: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ImpactDeck {
+    pub deck_hash: String,
+    pub deck_name: String,
+    pub subscribed_at: Option<String>,
+    pub subscribed_days: Option<i64>,
+    pub community: ImpactDeckCommunity,
+    pub mine: ImpactCounts,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MyImpactStats {
+    pub generated_at: String,
+    pub tracking_since: Option<String>,
+    pub totals: ImpactTotals,
+    pub milestone: ImpactMilestone,
+    pub latest_accepted: Option<ImpactLatestAccepted>,
+    pub decks: Vec<ImpactDeck>,
 }

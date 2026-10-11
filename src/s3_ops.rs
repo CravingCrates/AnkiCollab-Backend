@@ -21,7 +21,6 @@ use crate::database::AppState;
 fn parse_retry_delay<E>(err: &SdkError<E>) -> Option<Duration> {
     let resp = err.raw_response()?;
     let headers = resp.headers();
-
     // Prefer standard header if present.
     // Retry-After can be either seconds or an HTTP-date; we only support seconds.
     if let Some(v) = headers.get("retry-after") {
@@ -30,7 +29,6 @@ fn parse_retry_delay<E>(err: &SdkError<E>) -> Option<Duration> {
             return Some(Duration::from_secs(secs));
         }
     }
-
     // Ceph RGW often provides these.
     for key in ["ratelimit-reset", "x-ratelimit-reset", "x-rate-limit-reset"] {
         if let Some(v) = headers.get(key) {
@@ -47,7 +45,6 @@ fn parse_retry_delay<E>(err: &SdkError<E>) -> Option<Duration> {
             }
         }
     }
-
     None
 }
 
@@ -153,17 +150,23 @@ pub async fn get_object(
     state: &AppState,
     bucket: &str,
     key: &str,
+    range: Option<String>,
 ) -> Result<aws_sdk_s3::operation::get_object::GetObjectOutput, S3OpError> {
     let res = call_with_retry::<_, aws_sdk_s3::operation::get_object::GetObjectError, _, _>(
         state,
-        || state.s3_client.get_object().bucket(bucket).key(key).send(),
+        || {
+            let mut builder = state.s3_client.get_object().bucket(bucket).key(key);
+            if let Some(r) = range.clone() {
+                builder = builder.range(r);
+            }
+            builder.send()
+        },
     )
     .await;
 
     if let Err(ref err) = res {
         log_s3_error("get_object", bucket, Some(key), err);
     }
-
     res
 }
 
@@ -181,7 +184,6 @@ pub async fn head_object(
     if let Err(ref err) = res {
         log_s3_error("head_object", bucket, Some(key), err);
     }
-
     res
 }
 
@@ -206,7 +208,6 @@ pub async fn delete_object(
     if let Err(ref err) = res {
         log_s3_error("delete_object", bucket, Some(key), err);
     }
-
     res
 }
 
@@ -232,7 +233,6 @@ pub async fn delete_objects(
     if let Err(ref err) = res {
         log_s3_error("delete_objects", bucket, None, err);
     }
-
     res
 }
 
@@ -265,7 +265,6 @@ pub async fn list_objects_v2(
     if let Err(ref err) = res {
         log_s3_error("list_objects_v2", bucket, prefix.as_deref(), err);
     }
-
     res
 }
 
@@ -300,7 +299,6 @@ pub async fn list_objects_v2_with_client(
     if let Err(ref err) = res {
         log_s3_error("list_objects_v2", bucket, prefix.as_deref(), err);
     }
-
     res
 }
 
@@ -333,6 +331,5 @@ pub async fn put_object(
     if let Err(ref err) = res {
         log_s3_error("put_object", bucket, Some(key), err);
     }
-
     res
 }

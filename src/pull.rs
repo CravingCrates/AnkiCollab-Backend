@@ -549,32 +549,6 @@ async fn get_optional_tag_groups(
     Ok(rows)
 }
 
-pub async fn get_id_from_username(
-    db_state: &Arc<database::AppState>,
-    username: String,
-) -> std::result::Result<i32, Box<dyn std::error::Error + Send + Sync>> {
-    let client = match db_state.db_pool.get().await {
-        Ok(pool) => pool,
-        Err(err) => {
-            println!("Error getting pool: {err}");
-            return Err("Failed to retrieve a pooled connection".into());
-        }
-    };
-    let normalized_username = username.to_lowercase();
-    let rows = client
-        .query(
-            "SELECT id FROM users WHERE username = $1",
-            &[&normalized_username],
-        )
-        .await?;
-
-    if rows.is_empty() {
-        return Err("User does not exist".to_string().into());
-    }
-
-    Ok(rows[0].get(0))
-}
-
 pub async fn get_deck_last_update_unix(
     db_state: &Arc<database::AppState>,
     deck_hash: &str,

@@ -121,7 +121,7 @@ pub(crate) async fn download_media_file(
 
     // Get file from S3
     let s3_key = format!("{}/{}", &hash[0..2], hash);
-    let object = s3_ops::get_object(&state, media_bucket(), &s3_key)
+    let object = s3_ops::get_object(&state, media_bucket(), &s3_key, None)
         .await
         .map_err(|err| match err {
             S3OpError::TooManyRequests => (

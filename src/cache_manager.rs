@@ -82,7 +82,7 @@ pub async fn fetch_cache_bootstrap_response(
     deck_hash: &str,
 ) -> Result<Value, String> {
     let pointer_key = deck_cache_pointer_key(deck_hash);
-    let object = s3_ops::get_object(state, deck_cache_bucket(), &pointer_key)
+    let object = s3_ops::get_object(state, deck_cache_bucket(), &pointer_key, None)
         .await
         .map_err(|err| format!("failed to fetch cache pointer from S3: deck_hash={deck_hash}; key={pointer_key}; err={err:?}"))?;
 
@@ -125,7 +125,7 @@ pub async fn fetch_cache_bootstrap_response(
 
     let mut archive_key_from_manifest: Option<String> = None;
 
-    match s3_ops::get_object(state, deck_cache_bucket(), &manifest_key).await {
+    match s3_ops::get_object(state, deck_cache_bucket(), &manifest_key, None).await {
         Ok(manifest_obj) => match manifest_obj.body.collect().await {
             Ok(body) => {
                 if let Ok(manifest_json) = serde_json::from_slice::<Value>(&body.into_bytes()) {

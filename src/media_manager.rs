@@ -1941,7 +1941,7 @@ pub async fn confirm_media_bulk_upload(
             }
 
             // Head check passed, now download and validate file content
-            let validation_result = match s3_ops::get_object(&state, MEDIA_BUCKET.as_str(), &s3_key).await {
+            let validation_result = match s3_ops::get_object(&state, MEDIA_BUCKET.as_str(), &s3_key, None).await {
                 Ok(output) => {
                     // Validate the file content (signature and hash)
                     match validate_media_stream(output.body, &file.hash).await {

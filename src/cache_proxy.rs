@@ -4,7 +4,7 @@ use std::sync::Arc;
 use axum::{
     body::Body,
     extract::{Query, State},
-    http::StatusCode,
+    http::{header, HeaderMap, StatusCode},
     response::Response,
     routing::get,
     Router,
@@ -17,24 +17,32 @@ use crate::cache_manager::deck_cache_bucket;
 use crate::database::AppState;
 use crate::s3_ops::{self, S3OpError};
 
-const CACHE_TOKEN_MAX_REUSES: u8 = 3;
+const CACHE_TOKEN_MAX_REUSES: u8 = 25;
 
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new().route("/v1/cache/object", get(download_cache_object))
 }
 
+// Parses only "bytes=<start>-" (open-ended, single range) -- that's all our own client sends
+fn parse_range_start(headers: &HeaderMap) -> Option<u64> {
+    let raw = headers.get(header::RANGE)?.to_str().ok()?;
+    raw.strip_prefix("bytes=")?.split('-').next()?.parse().ok()
+}
+
 async fn download_cache_object(
     State(state): State<Arc<AppState>>,
     Query(query): Query<CacheQuery>,
+    headers: HeaderMap,
 ) -> Result<Response, (StatusCode, String)> {
     let claims = state
         .cache_token_service
         .verify_token(&query.token)
         .map_err(|_| (StatusCode::UNAUTHORIZED, "Unauthorized".to_string()))?;
 
-    register_token_use(&state, &query.token, claims.exp, CACHE_TOKEN_MAX_REUSES).await?;
+    let range_start = parse_range_start(&headers);
+    let range = range_start.map(|s| format!("bytes={s}-"));
 
-    let object = s3_ops::get_object(&state, deck_cache_bucket(), &claims.s3_key)
+    let object = s3_ops::get_object(&state, deck_cache_bucket(), &claims.s3_key, range)
         .await
         .map_err(|err| match err {
             S3OpError::NotFound => (StatusCode::NOT_FOUND, "Not found".to_string()),
@@ -48,17 +56,29 @@ async fn download_cache_object(
             ),
         })?;
 
+    register_token_use(&state, &query.token, claims.exp, CACHE_TOKEN_MAX_REUSES).await?;
+
     let content_type = claims
         .content_type
         .unwrap_or_else(|| infer_content_type(&claims.s3_key).to_string());
 
     let content_length = object.content_length();
+    let status = if range_start.is_some() && object.content_range().is_some() {
+        StatusCode::PARTIAL_CONTENT
+    } else {
+        StatusCode::OK
+    };
 
     let mut builder = Response::builder()
-        .status(StatusCode::OK)
+        .status(status)
         .header("Content-Type", content_type)
         .header("Cache-Control", "public, max-age=3600")
+        .header("Accept-Ranges", "bytes")
         .header("Access-Control-Allow-Origin", "*");
+
+    if let Some(cr) = object.content_range() {
+        builder = builder.header(axum::http::header::CONTENT_RANGE, cr);
+    }
 
     if let Some(length) = content_length {
         if length > 0 {
@@ -96,7 +116,6 @@ async fn register_token_use(
 ) -> Result<(), (StatusCode, String)> {
     let mut cache = state.cache_token_replay_cache.lock().await;
     let now = Utc::now().timestamp();
-
     cache.retain(|_, (expiry, _)| *expiry >= now);
 
     match cache.entry(token.to_string()) {

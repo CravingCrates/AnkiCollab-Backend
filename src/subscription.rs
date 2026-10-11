@@ -27,7 +27,9 @@ pub async fn add(
     let deck_id: i64 = deck_id[0].get(0);
     let result = client
         .query(
-            "INSERT INTO subscriptions (deck_id, user_hash) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+            // `created_at` has no DEFAULT: that would stamp every pre-existing subscriber with the
+            // migration date and fake a spike. NULL means "before tracking started".
+            "INSERT INTO subscriptions (deck_id, user_hash, created_at) VALUES ($1, $2, now()) ON CONFLICT DO NOTHING",
             &[&deck_id, &user_hash],
         )
         .await;

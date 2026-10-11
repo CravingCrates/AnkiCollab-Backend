@@ -21,11 +21,11 @@ pub mod cache_proxy;
 pub mod cache_tokens;
 pub mod changelog;
 pub mod cleanser;
+pub mod contribution_stats;
 pub mod database;
 pub mod error;
 pub mod human_hash;
 pub mod inheritance;
-pub mod media;
 pub mod media_logger;
 pub mod media_manager;
 pub mod media_proxy;
@@ -34,6 +34,7 @@ pub mod media_tokens;
 pub mod note_removal;
 pub mod notetypes;
 pub mod notifications;
+pub mod pairing;
 pub mod pull;
 pub mod push;
 pub mod rate_limiter;
@@ -301,7 +302,8 @@ pub async fn process_card(
             return;
         }
 
-        let mut anki_deck = if let Ok(deck) = structs::AnkiDeck::from_json_string(&info.deck) {
+        let mut anki_deck = if let Ok(deck) = serde_json::from_str::<structs::AnkiDeck>(&info.deck)
+        {
             deck
         } else {
             send((StatusCode::BAD_REQUEST, "Invalid deck data".to_string()));
@@ -527,7 +529,7 @@ pub async fn remove_token(
     auth_user: AuthenticatedUser,
     State(db_state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    match auth::remove_token_by_user_id(&db_state, auth_user.user_id).await {
+    match auth::remove_token_by_hash(&db_state, &auth_user.token_hash).await {
         Ok(res) => (StatusCode::OK, res),
         Err(_error) => {
             // Token not found or already removed - expected behavior
@@ -635,6 +637,8 @@ pub async fn confirm_media_bulk_async(
 pub async fn check_for_update(
     ClientIp(_iip): ClientIp,
     State(state): State<Arc<AppState>>,
+    // Optional: released clients call this without a token, and it must keep working for them.
+    auth_user: Option<AuthenticatedUser>,
     Json(input): Json<HashMap<String, structs::UpdateInfo>>,
 ) -> impl IntoResponse {
     let mut responses: Vec<Value> = Vec::with_capacity(input.iter().len());
@@ -785,6 +789,22 @@ pub async fn check_for_update(
         };
     }
 
+    if let Some(auth_user) = auth_user {
+        let deck_hashes: Vec<String> = input.keys().cloned().collect();
+        // Spawned rather than awaited: this is the sync path, and a slow pool checkout or row lock
+        // must not delay a pull that has already done its work. Not skipped when the pull returned
+        // nothing, though — "active" means still syncing, and an up-to-date subscriber is exactly
+        // who this counts.
+        let state = Arc::clone(&state);
+        tokio::spawn(async move {
+            if let Err(err) =
+                contribution_stats::touch_last_synced(&state, auth_user.user_id, &deck_hashes).await
+            {
+                tracing::warn!(error = %err, "Failed to record last_synced_at for synced decks");
+            }
+        });
+    }
+
     let json_bytes = serde_json::to_vec(&responses).unwrap();
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
     encoder.write_all(&json_bytes).unwrap();
@@ -842,7 +862,7 @@ pub async fn post_data(
 
     let owner_id = auth_user.user_id;
 
-    let anki_deck = match structs::AnkiDeck::from_json_string(&info.deck) {
+    let anki_deck = match serde_json::from_str::<structs::AnkiDeck>(&info.deck) {
         Ok(deck) => deck,
         Err(e) => {
             // Malformed client payload - expected behavior, just breadcrumb
@@ -1315,6 +1335,43 @@ async fn api_get_notifications(
     }
 }
 
+async fn api_get_my_impact_stats(
+    auth_user: AuthenticatedUser,
+    State(db_state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let user_hash = match auth::get_user_hash_by_user_id(&db_state, auth_user.user_id).await {
+        Ok(user_hash) => user_hash,
+        Err(err) => {
+            error::log_expected(
+                "api_get_my_impact_stats",
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &err.to_string(),
+            );
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "Could not resolve user"})),
+            )
+                .into_response();
+        }
+    };
+
+    match contribution_stats::get_my_impact(&db_state, auth_user.user_id, &user_hash).await {
+        Ok(payload) => (StatusCode::OK, Json(payload)).into_response(),
+        Err(err) => {
+            error::log_expected(
+                "api_get_my_impact_stats",
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &err.to_string(),
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "Failed to fetch impact statistics"})),
+            )
+                .into_response()
+        }
+    }
+}
+
 async fn api_get_notifications_history(
     auth_user: AuthenticatedUser,
     State(db_state): State<Arc<AppState>>,
@@ -1639,14 +1696,14 @@ async fn main() {
     );
     let _guard = sentry::init((
         env::var("SENTRY_URL").expect("SENTRY_URL must be set"),
-        sentry::ClientOptions {
-            release: sentry::release_name!(),
-            traces_sample_rate: 0.0,
-            sample_rate: 1.0,
-            auto_session_tracking: false,
-            max_breadcrumbs: 50,
-            send_default_pii: false,
-            before_send: Some(Arc::new(|mut event| {
+        sentry::ClientOptions::new()
+            .maybe_release(sentry::release_name!())
+            .traces_sample_rate(0.0)
+            .sample_rate(1.0)
+            .auto_session_tracking(false)
+            .max_breadcrumbs(50)
+            .send_default_pii(false)
+            .before_send(|mut event| {
                 static LAST_ERRORS: std::sync::LazyLock<
                     std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
                 > = std::sync::LazyLock::new(|| {
@@ -1690,9 +1747,9 @@ async fn main() {
                 last_errors.retain(|_, &mut v| now.duration_since(v).as_secs() < 300);
 
                 Some(event)
-            })),
+            })
             // Sample breadcrumbs to reduce data volume
-            before_breadcrumb: Some(Arc::new(|breadcrumb| {
+            .before_breadcrumb(|breadcrumb| {
                 // Only keep 30% of breadcrumbs to reduce noise
                 use std::collections::hash_map::RandomState;
                 use std::hash::BuildHasher;
@@ -1706,9 +1763,7 @@ async fn main() {
                 } else {
                     None
                 }
-            })),
-            ..Default::default()
-        },
+            }),
     ));
 
     let s3_access_key_id = std::env::var("S3_ACCESS_KEY_ID").expect("S3_ACCESS_KEY_ID must be set");
@@ -1882,6 +1937,38 @@ async fn main() {
             .unwrap(),
     );
 
+    // Pairing gets a limiter of its own rather than borrowing the standard one.
+    // Poll requests are unauthenticated, so the key is the client's IP and every
+    // device behind one NAT shares a bucket; a poll every two seconds charged to the
+    // shared budget would break pairing for exactly those networks. The poll token is
+    // what actually protects the endpoint, so this limit only has to stop a flood.
+    let pairing_governor_conf = Arc::new(
+        GovernorConfigBuilder::default()
+            .per_second(20)
+            .burst_size(60)
+            .use_headers()
+            .key_extractor(UserOrIpKeyExtractor)
+            .finish()
+            .unwrap(),
+    );
+
+    // Asking for a code is a write, and anyone can trigger it without authenticating,
+    // so it gets a budget sized for a person rather than for a poll: a device ever
+    // needs one code, and a whole office behind a single address pairing at once still
+    // fits. This limit is the only lever on that write - the expiry sweep bounds how
+    // long a row lives, not how fast rows arrive.
+    let pair_init_governor_conf = Arc::new(
+        GovernorConfigBuilder::default()
+            .per_second(1)
+            .burst_size(5)
+            .use_headers()
+            .key_extractor(UserOrIpKeyExtractor)
+            .finish()
+            .unwrap(),
+    );
+
+    let pairing_governor_limiter = pairing_governor_conf.limiter().clone();
+    let pair_init_governor_limiter = pair_init_governor_conf.limiter().clone();
     let strict_governor_limiter = strict_governor_conf.limiter().clone();
     let standard_governor_limiter = standard_governor_conf.limiter().clone();
 
@@ -1891,6 +1978,8 @@ async fn main() {
         std::thread::sleep(interval);
         strict_governor_limiter.retain_recent();
         standard_governor_limiter.retain_recent();
+        pairing_governor_limiter.retain_recent();
+        pair_init_governor_limiter.retain_recent();
     });
 
     // start media cleanup task
@@ -1962,6 +2051,23 @@ async fn main() {
                 .execute("REFRESH MATERIALIZED VIEW deck_stats", &[])
                 .await
                 .expect("Error executing large decks statement 2");
+
+            match contribution_stats::snapshot_deck_subscribers(&client).await {
+                Ok(rows) => {
+                    if rows > 0 {
+                        println!("Snapshotted subscriber counts for {rows} decks");
+                    }
+                }
+                Err(err) => println!("Error snapshotting subscriber counts: {err}"),
+            }
+
+            client
+                .execute(
+                    "DELETE FROM login_logs WHERE occurred_at < now() - INTERVAL '90 days'",
+                    &[],
+                )
+                .await
+                .expect("Error executing large decks statement 2");
         }
     });
 
@@ -2020,6 +2126,7 @@ async fn main() {
             get(api_get_notifications_history),
         )
         .route("/MarkNotificationsRead", post(api_mark_notifications_read))
+        .route("/GetMyImpactStats", get(api_get_my_impact_stats))
         .route(
             "/GetCommitSnapshot/{commit_id}",
             get(api_get_commit_snapshot),
@@ -2039,11 +2146,29 @@ async fn main() {
         .route("/refreshToken", post(refresh_auth_token))
         .layer(GovernorLayer::new(strict_governor_conf));
 
+    // Pairing: the addon asks for a code here and then polls for its approval, while
+    // the website is what marks it approved. Both are unauthenticated by necessity,
+    // because the client has no token yet - that is the point of the flow.
+    //
+    // Two routers because the calls are not alike. Poll is a read that only the holder
+    // of an unguessable token can make; init is a write anyone can make. Giving them
+    // one shared budget would mean either a poll limit too tight for a shared address
+    // or a write limit too loose to be a limit at all.
+    let pair_poll_routes = Router::new()
+        .route("/pair/poll", post(pairing::post_pair_poll))
+        .layer(GovernorLayer::new(pairing_governor_conf));
+
+    let pair_init_routes = Router::new()
+        .route("/pair/init", post(pairing::post_pair_init))
+        .layer(GovernorLayer::new(pair_init_governor_conf));
+
     let media_routes = Router::new().nest("/media", media_routes());
 
     let app = Router::new()
         .merge(basic_routes)
         .merge(auth_routes)
+        .merge(pair_poll_routes)
+        .merge(pair_init_routes)
         .merge(media_routes)
         // standard rate limiting - applied to all routes EXCEPT media proxy
         .merge(media_proxy::routes().layer(axum::extract::DefaultBodyLimit::max(20 * 1024 * 1024)))

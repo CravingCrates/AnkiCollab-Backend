@@ -122,6 +122,7 @@ pub async fn unpack_notes(
         SELECT u.anki_id, u.guid, nt.id, $3, NOW(), $4, $5
         FROM UNNEST($1::text[], $2::text[], $6::bigint[]) AS u(guid, notetype_guid, anki_id)
         JOIN notetype nt ON nt.guid = u.notetype_guid AND nt.owner = $7
+        ON CONFLICT (deck, guid) DO NOTHING
         RETURNING id, guid";
     let insert_notes_stmt = client.prepare(insert_notes_query).await?;
 
@@ -165,6 +166,11 @@ pub async fn unpack_notes(
 
         // Validate and prepare notes for insertion
         for note in batch {
+            if note.guid.trim().is_empty() {
+                // We rarely hit this, but i don't know what the client issue is that causes it...
+                continue;
+            }
+
             let notetype_guid = match notetype_map.get(&note.note_model_uuid) {
                 Some(guid) => guid,
                 None => {
@@ -547,6 +553,7 @@ pub async fn handle_notes_and_media_update(
     Ok(())
 }
 
+#[allow(clippy::double_must_use)]
 #[allow(clippy::too_many_arguments)] // TODO: refactor arguments into a struct
 #[async_recursion]
 pub async fn unpack_deck_data(
@@ -737,6 +744,7 @@ pub async fn create_root_deck(
     Ok((id, use_hum))
 }
 
+#[allow(clippy::double_must_use)]
 #[allow(clippy::too_many_arguments)] // TODO: refactor arguments into a struct
 #[async_recursion]
 pub async fn unpack_deck_json(

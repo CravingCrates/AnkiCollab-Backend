@@ -30,6 +30,37 @@ pub struct AuthResponse {
 pub struct Login {
     pub username: String,
     pub password: String,
+    /// Stable per Anki profile. A client that predates device tokens sends nothing
+    /// and lands on the legacy sentinel, keeping the previous behaviour exactly.
+    #[serde(default = "legacy_device_id")]
+    pub device_id: String,
+}
+
+fn legacy_device_id() -> String {
+    LEGACY_DEVICE_ID.to_string()
+}
+
+/// What a request with no usable `device_id` is treated as.
+///
+/// Also the default for the `device_id` column, so pre-existing rows and
+/// un-updated clients agree without a backfill.
+pub const LEGACY_DEVICE_ID: &str = "legacy";
+
+/// Client-supplied, so bounded and validated: it is a database key and it ends up
+/// in logs. Anything unacceptable collapses to the legacy sentinel rather than
+/// failing the login, so a bad value degrades to the old behaviour instead of
+/// locking a user out.
+pub(crate) fn normalise_device_id(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.len() > 64
+        || !trimmed
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return legacy_device_id();
+    }
+    trimmed.to_string()
 }
 
 #[derive(Deserialize)]
@@ -41,11 +72,15 @@ use database::SharedConn;
 
 // ── Authenticated user extractor ─────────────────────────────────────
 // Reads `Authorization: Bearer <token>` from request headers.
-// If present and valid, yields `AuthenticatedUser { user_id }`.
+// If present and valid, yields `AuthenticatedUser`.
 // Use `Option<AuthenticatedUser>` for endpoints where auth is optional.
 
 pub struct AuthenticatedUser {
     pub user_id: i32,
+    /// The hash of the token this request arrived with, so a handler can act on the
+    /// caller's own row. That is what logging out one device needs. Deliberately not
+    /// the raw token, and this struct is deliberately not `Debug`.
+    pub token_hash: Vec<u8>,
 }
 
 impl FromRequestParts<Arc<database::AppState>> for AuthenticatedUser {
@@ -80,7 +115,10 @@ impl FromRequestParts<Arc<database::AppState>> for AuthenticatedUser {
             return Err((StatusCode::UNAUTHORIZED, "Invalid token".to_string()));
         }
 
-        Ok(Self { user_id })
+        Ok(Self {
+            user_id,
+            token_hash: hash_token(token),
+        })
     }
 }
 
@@ -108,19 +146,23 @@ impl OptionalFromRequestParts<Arc<database::AppState>> for AuthenticatedUser {
         }
 
         match get_user_from_token(state, &token).await {
-            Ok(user_id) if user_id > 0 => Ok(Some(Self { user_id })),
+            Ok(user_id) if user_id > 0 => Ok(Some(Self {
+                user_id,
+                token_hash: hash_token(&token),
+            })),
             _ => Ok(None),
         }
     }
 }
 
 // Generate a secure random token of specified length
-fn generate_secure_token(length: usize) -> String {
+// Shared with the pairing flow, which issues a poll token and stores it the same way.
+pub(crate) fn generate_secure_token(length: usize) -> String {
     Alphanumeric.sample_string(&mut rand::rng(), length)
 }
 
 // Hash a token for secure storage
-fn hash_token(token: &str) -> Vec<u8> {
+pub(crate) fn hash_token(token: &str) -> Vec<u8> {
     let mut hasher = Sha256::new();
     hasher.update(token.as_bytes());
     hasher.finalize().to_vec()
@@ -152,7 +194,8 @@ pub async fn login(
 
     if verify_password(&form.password, &password_hash)? {
         // Generate new tokens
-        let auth_response = generate_tokens(&client, user_id)
+        let device_id = normalise_device_id(&form.device_id);
+        let auth_response = generate_tokens(&client, user_id, &device_id)
             .await
             .map_err(|e| format!("Error generating tokens: {e}"))?;
 
@@ -167,10 +210,11 @@ fn verify_password(password: &str, hash: &str) -> Result<bool, String> {
         .map_err(|e| format!("Password verification error: {e}"))
 }
 
-// Generate new tokens for a user
+// Generate new tokens for a user, replacing that device's previous row.
 pub async fn generate_tokens(
     client: &SharedConn,
     user_id: i32,
+    device_id: &str,
 ) -> Result<AuthResponse, Box<dyn std::error::Error + Send + Sync>> {
     let access_token = generate_secure_token(ACCESS_TOKEN_LENGTH);
     let refresh_token = generate_secure_token(REFRESH_TOKEN_LENGTH);
@@ -184,10 +228,13 @@ pub async fn generate_tokens(
 
     client
         .execute(
+            // Conflict on (user_id, device_id), not on user_id: a login or a refresh
+            // on one device used to overwrite every other device's row, which silently
+            // signed those devices out.
             "INSERT INTO auth_tokens 
-            (user_id, token_hash, refresh_token_hash, expires_at, refresh_expires_at) 
-         VALUES ($1, $2, $3, $4, $5)
-         ON CONFLICT (user_id) 
+            (user_id, device_id, token_hash, refresh_token_hash, expires_at, refresh_expires_at) 
+         VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT (user_id, device_id) 
          DO UPDATE SET 
             token_hash = EXCLUDED.token_hash, 
             refresh_token_hash = EXCLUDED.refresh_token_hash,
@@ -196,6 +243,7 @@ pub async fn generate_tokens(
             last_used_at = NOW()",
             &[
                 &user_id,
+                &device_id,
                 &access_token_hash,
                 &refresh_token_hash,
                 &access_expires,
@@ -228,10 +276,10 @@ pub async fn refresh_token(
     // Hash the provided refresh token
     let refresh_token_hash = hash_token(&refresh_req.refresh_token);
 
-    // Look up the user by refresh token hash
+    // Look up the user and the device by refresh token hash
     let row = client
         .query_opt(
-            "SELECT user_id FROM auth_tokens 
+            "SELECT user_id, device_id FROM auth_tokens 
          WHERE refresh_token_hash = $1 
          AND refresh_expires_at > NOW()",
             &[&refresh_token_hash],
@@ -239,13 +287,15 @@ pub async fn refresh_token(
         .await
         .map_err(|e| format!("Database error: {e}"))?;
 
-    // If found, generate new tokens
+    // If found, generate new tokens for the same device, so refreshing here cannot
+    // disturb any other device's row.
     match row {
         Some(row) => {
             let user_id: i32 = row.get(0);
+            let device_id: String = row.get(1);
 
             // Generate new tokens
-            let auth_response = generate_tokens(&client, user_id)
+            let auth_response = generate_tokens(&client, user_id, &device_id)
                 .await
                 .map_err(|e| format!("Error generating tokens: {e}"))?;
 
@@ -255,9 +305,13 @@ pub async fn refresh_token(
     }
 }
 
-pub async fn remove_token(
+/// Remove exactly one token row, identified by its hash.
+///
+/// Logging out on one device must not sign the account out everywhere, which is
+/// what deleting by `user_id` would now do.
+pub async fn remove_token_by_hash(
     db_state: &Arc<database::AppState>,
-    token: &str,
+    token_hash: &[u8],
 ) -> std::result::Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let client = match db_state.db_pool.get().await {
         Ok(pool) => pool,
@@ -266,9 +320,6 @@ pub async fn remove_token(
             return Err("Internal Error".into());
         }
     };
-
-    // Create a hash of the token
-    let token_hash = hash_token(token);
 
     let result = client
         .execute(
@@ -460,6 +511,21 @@ pub async fn get_username_by_user_id(
     Ok(row.get(0))
 }
 
+#[must_use]
+pub fn user_hash_from_username(username: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(username.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+pub async fn get_user_hash_by_user_id(
+    db_state: &Arc<database::AppState>,
+    user_id: i32,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let username = get_username_by_user_id(db_state, user_id).await?;
+    Ok(user_hash_from_username(&username))
+}
+
 /// Check if a user (by ID) is an owner or maintainer of a deck (by `human_hash`).
 /// Equivalent to `is_valid_user_token` but works with `user_id` directly,
 /// avoiding a redundant token lookup.
@@ -504,8 +570,12 @@ pub async fn is_deck_owner_or_maintainer(
     Ok(!rows.is_empty())
 }
 
-/// Remove all auth tokens for a user (used with `AuthenticatedUser` extractor)
-pub async fn remove_token_by_user_id(
+/// Remove all auth tokens for a user.
+///
+/// Unused by any route since logout became device-scoped. Kept for an explicit
+/// "sign out everywhere" action; do not wire it to the ordinary logout button, as
+/// that would sign the user out of every device they are logged in on.
+pub async fn remove_all_tokens_for_user(
     db_state: &Arc<database::AppState>,
     user_id: i32,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
@@ -520,4 +590,44 @@ pub async fn remove_token_by_user_id(
     }
 
     Ok("Token successfully removed".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_device_id_is_bounded_and_sanitised() {
+        // The value is client-supplied and becomes a database key, so anything a
+        // client could use to smuggle in separators, control characters or unbounded
+        // length collapses to the legacy sentinel.
+        assert_eq!(normalise_device_id("abc-123_X"), "abc-123_X");
+        assert_eq!(normalise_device_id("  abc  "), "abc");
+        assert_eq!(normalise_device_id(""), LEGACY_DEVICE_ID);
+        assert_eq!(normalise_device_id("   "), LEGACY_DEVICE_ID);
+        assert_eq!(normalise_device_id("has space"), LEGACY_DEVICE_ID);
+        assert_eq!(normalise_device_id("has/slash"), LEGACY_DEVICE_ID);
+        assert_eq!(normalise_device_id("has\u{0}null"), LEGACY_DEVICE_ID);
+        assert_eq!(normalise_device_id(&"a".repeat(65)), LEGACY_DEVICE_ID);
+        assert_eq!(normalise_device_id(&"a".repeat(64)), "a".repeat(64));
+    }
+
+    #[test]
+    fn a_login_without_a_device_id_is_treated_as_legacy() {
+        // This is what keeps already-shipped addon builds working exactly as before:
+        // they send no device id and land on the same sentinel the column default
+        // gives the rows that already exist.
+        let login: Login = serde_json::from_str(r#"{"username":"a","password":"b"}"#)
+            .expect("an absent device id must be accepted");
+        assert_eq!(login.device_id, LEGACY_DEVICE_ID);
+        assert_eq!(normalise_device_id(&login.device_id), LEGACY_DEVICE_ID);
+    }
+
+    #[test]
+    fn the_subscription_user_hash_is_sha256_of_the_username() {
+        assert_eq!(
+            user_hash_from_username("alice"),
+            "2bd806c97f0e00af1a1fc3328fa763a9269723c8db8fac4f93af71db186d6e90"
+        );
+    }
 }
