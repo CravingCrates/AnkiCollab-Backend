@@ -2,8 +2,10 @@
 -- PostgreSQL database dump
 --
 
--- Dumped from database version 18.3 (Ubuntu 18.3-1.pgdg24.04+1)
--- Dumped by pg_dump version 18.3 (Ubuntu 18.3-1.pgdg24.04+1)
+\restrict kZvOvCU0NNTgkrwo44Spn69VWlv5EfClNFOePbtmKdszhDhZ1BltrXzzZWeDO6t
+
+-- Dumped from database version 18.6 (Ubuntu 18.6-1.pgdg24.04+2)
+-- Dumped by pg_dump version 18.6 (Ubuntu 18.6-1.pgdg24.04+2)
 
 SET statement_timeout = 0;
 SET lock_timeout = 0;
@@ -191,7 +193,8 @@ CREATE TABLE anki.auth_tokens (
     expires_at timestamp with time zone NOT NULL,
     refresh_expires_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    last_used_at timestamp with time zone DEFAULT now() NOT NULL
+    last_used_at timestamp with time zone DEFAULT now() NOT NULL,
+    device_id text DEFAULT 'legacy'::text NOT NULL
 );
 
 
@@ -429,6 +432,21 @@ CREATE MATERIALIZED VIEW anki.deck_stats AS
 
 
 ALTER MATERIALIZED VIEW anki.deck_stats OWNER TO postgres;
+
+--
+-- Name: deck_stats_daily; Type: TABLE; Schema: anki; Owner: postgres
+--
+
+CREATE TABLE anki.deck_stats_daily (
+    deck_id bigint NOT NULL,
+    captured_on date NOT NULL,
+    subscriber_count integer DEFAULT 0 NOT NULL,
+    active_30d integer DEFAULT 0 NOT NULL,
+    active_90d integer DEFAULT 0 NOT NULL
+);
+
+
+ALTER TABLE anki.deck_stats_daily OWNER TO postgres;
 
 --
 -- Name: deck_subscriptions; Type: TABLE; Schema: anki; Owner: postgres
@@ -1053,6 +1071,7 @@ CREATE TABLE anki.notifications (
     reason text,
     is_read boolean DEFAULT false NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
+    actor_user_id integer,
     CONSTRAINT notifications_status_check CHECK (((status)::text = ANY ((ARRAY['approved'::character varying, 'denied'::character varying])::text[])))
 );
 
@@ -1137,7 +1156,9 @@ ALTER TABLE anki.subscription_field_policy OWNER TO postgres;
 CREATE TABLE anki.subscriptions (
     id integer NOT NULL,
     user_hash character varying(255) NOT NULL,
-    deck_id bigint NOT NULL
+    deck_id bigint NOT NULL,
+    created_at timestamp with time zone,
+    last_synced_at timestamp with time zone
 );
 
 
@@ -1220,6 +1241,56 @@ CREATE TABLE anki.user_quotas (
 ALTER TABLE anki.user_quotas OWNER TO postgres;
 
 --
+-- Name: device_pair_sessions; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.device_pair_sessions (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    code character varying(7) NOT NULL,
+    poll_token_hash bytea NOT NULL,
+    device_id text NOT NULL,
+    user_id integer,
+    status character varying(16) DEFAULT 'pending'::character varying NOT NULL,
+    expires_at timestamp with time zone NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT device_pair_sessions_status_check CHECK (((status)::text = ANY ((ARRAY['pending'::character varying, 'approved'::character varying, 'consumed'::character varying, 'rejected'::character varying])::text[])))
+);
+
+
+ALTER TABLE public.device_pair_sessions OWNER TO postgres;
+
+--
+-- Name: passkey_credentials; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.passkey_credentials (
+    id integer NOT NULL,
+    user_id integer NOT NULL,
+    name character varying(64) DEFAULT 'Passkey'::character varying NOT NULL,
+    credential_id bytea NOT NULL,
+    passkey jsonb NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    last_used_at timestamp with time zone
+);
+
+
+ALTER TABLE public.passkey_credentials OWNER TO postgres;
+
+--
+-- Name: passkey_credentials_id_seq; Type: SEQUENCE; Schema: public; Owner: postgres
+--
+
+ALTER TABLE public.passkey_credentials ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTITY (
+    SEQUENCE NAME public.passkey_credentials_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
+);
+
+
+--
 -- Name: users; Type: TABLE; Schema: public; Owner: postgres
 --
 
@@ -1230,7 +1301,8 @@ CREATE TABLE public.users (
     is_admin boolean DEFAULT false,
     signup_ip inet NOT NULL,
     created_at timestamp without time zone DEFAULT now() NOT NULL,
-    deleted_at timestamp with time zone
+    deleted_at timestamp with time zone,
+    uuid uuid DEFAULT gen_random_uuid() NOT NULL
 );
 
 
@@ -1450,6 +1522,14 @@ ALTER TABLE ONLY anki.changelogs
 
 ALTER TABLE ONLY anki.commits
     ADD CONSTRAINT commits_pkey PRIMARY KEY (commit_id);
+
+
+--
+-- Name: deck_stats_daily deck_stats_daily_pkey; Type: CONSTRAINT; Schema: anki; Owner: postgres
+--
+
+ALTER TABLE ONLY anki.deck_stats_daily
+    ADD CONSTRAINT deck_stats_daily_pkey PRIMARY KEY (deck_id, captured_on);
 
 
 --
@@ -1725,6 +1805,46 @@ ALTER TABLE ONLY anki.user_quotas
 
 
 --
+-- Name: device_pair_sessions device_pair_sessions_code_key; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.device_pair_sessions
+    ADD CONSTRAINT device_pair_sessions_code_key UNIQUE (code);
+
+
+--
+-- Name: device_pair_sessions device_pair_sessions_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.device_pair_sessions
+    ADD CONSTRAINT device_pair_sessions_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: device_pair_sessions device_pair_sessions_poll_token_hash_key; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.device_pair_sessions
+    ADD CONSTRAINT device_pair_sessions_poll_token_hash_key UNIQUE (poll_token_hash);
+
+
+--
+-- Name: passkey_credentials passkey_credentials_credential_id_key; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.passkey_credentials
+    ADD CONSTRAINT passkey_credentials_credential_id_key UNIQUE (credential_id);
+
+
+--
+-- Name: passkey_credentials passkey_credentials_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.passkey_credentials
+    ADD CONSTRAINT passkey_credentials_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: users users_email_key; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
@@ -1783,10 +1903,10 @@ CREATE INDEX idx_auth_tokens_token_hash ON anki.auth_tokens USING btree (token_h
 
 
 --
--- Name: idx_auth_tokens_user_id; Type: INDEX; Schema: anki; Owner: postgres
+-- Name: idx_auth_tokens_user_device; Type: INDEX; Schema: anki; Owner: postgres
 --
 
-CREATE UNIQUE INDEX idx_auth_tokens_user_id ON anki.auth_tokens USING btree (user_id);
+CREATE UNIQUE INDEX idx_auth_tokens_user_device ON anki.auth_tokens USING btree (user_id, device_id);
 
 
 --
@@ -1801,6 +1921,13 @@ CREATE INDEX idx_commits_deck ON anki.commits USING btree (deck) WHERE (deck IS 
 --
 
 CREATE INDEX idx_commits_id_deck ON anki.commits USING btree (commit_id, deck);
+
+
+--
+-- Name: idx_commits_user_deck; Type: INDEX; Schema: anki; Owner: postgres
+--
+
+CREATE INDEX idx_commits_user_deck ON anki.commits USING btree (user_id) WHERE (deck IS NOT NULL);
 
 
 --
@@ -1892,6 +2019,13 @@ CREATE INDEX idx_notetype_field_protected_notetype ON anki.notetype_field USING 
 --
 
 CREATE INDEX idx_notifications_commit_user ON anki.notifications USING btree (commit_id, user_id);
+
+
+--
+-- Name: idx_notifications_deck_created_at; Type: INDEX; Schema: anki; Owner: postgres
+--
+
+CREATE INDEX idx_notifications_deck_created_at ON anki.notifications USING btree (deck_id, created_at DESC);
 
 
 --
@@ -1993,6 +2127,13 @@ CREATE INDEX subscriptions_deck_id_idx ON anki.subscriptions USING btree (deck_i
 
 
 --
+-- Name: subscriptions_deck_last_synced_idx; Type: INDEX; Schema: anki; Owner: postgres
+--
+
+CREATE INDEX subscriptions_deck_last_synced_idx ON anki.subscriptions USING btree (deck_id, last_synced_at);
+
+
+--
 -- Name: ~calculated_stats-1f6cb044; Type: INDEX; Schema: anki; Owner: postgres
 --
 
@@ -2091,10 +2232,45 @@ CREATE INDEX "~tags-baa66cc5" ON anki.tags USING btree (commit);
 
 
 --
+-- Name: idx_device_pair_sessions_code; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE UNIQUE INDEX idx_device_pair_sessions_code ON public.device_pair_sessions USING btree (code);
+
+
+--
+-- Name: idx_device_pair_sessions_expires_at; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX idx_device_pair_sessions_expires_at ON public.device_pair_sessions USING btree (expires_at);
+
+
+--
+-- Name: idx_device_pair_sessions_poll_hash; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX idx_device_pair_sessions_poll_hash ON public.device_pair_sessions USING btree (poll_token_hash);
+
+
+--
+-- Name: idx_passkey_credentials_user_id; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX idx_passkey_credentials_user_id ON public.passkey_credentials USING btree (user_id);
+
+
+--
 -- Name: idx_users_deleted_at; Type: INDEX; Schema: public; Owner: postgres
 --
 
 CREATE INDEX idx_users_deleted_at ON public.users USING btree (deleted_at) WHERE (deleted_at IS NOT NULL);
+
+
+--
+-- Name: idx_users_uuid; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE UNIQUE INDEX idx_users_uuid ON public.users USING btree (uuid);
 
 
 --
@@ -2166,6 +2342,14 @@ ALTER TABLE ONLY anki.commits
 
 ALTER TABLE ONLY anki.decks
     ADD CONSTRAINT deck_owner_constraint FOREIGN KEY (owner) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: deck_stats_daily deck_stats_daily_deck_id_fkey; Type: FK CONSTRAINT; Schema: anki; Owner: postgres
+--
+
+ALTER TABLE ONLY anki.deck_stats_daily
+    ADD CONSTRAINT deck_stats_daily_deck_id_fkey FOREIGN KEY (deck_id) REFERENCES anki.decks(id) ON DELETE CASCADE;
 
 
 --
@@ -2409,6 +2593,14 @@ ALTER TABLE ONLY anki.notetype_template
 
 
 --
+-- Name: notifications notifications_actor_user_id_fkey; Type: FK CONSTRAINT; Schema: anki; Owner: postgres
+--
+
+ALTER TABLE ONLY anki.notifications
+    ADD CONSTRAINT notifications_actor_user_id_fkey FOREIGN KEY (actor_user_id) REFERENCES public.users(id) ON DELETE SET NULL;
+
+
+--
 -- Name: notifications notifications_commit_fk; Type: FK CONSTRAINT; Schema: anki; Owner: postgres
 --
 
@@ -2473,6 +2665,22 @@ ALTER TABLE ONLY anki.user_quotas
 
 
 --
+-- Name: device_pair_sessions device_pair_sessions_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.device_pair_sessions
+    ADD CONSTRAINT device_pair_sessions_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: passkey_credentials passkey_credentials_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.passkey_credentials
+    ADD CONSTRAINT passkey_credentials_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
 -- Name: SCHEMA public; Type: ACL; Schema: -; Owner: postgres
 --
 
@@ -2483,4 +2691,6 @@ GRANT ALL ON SCHEMA public TO PUBLIC;
 --
 -- PostgreSQL database dump complete
 --
+
+\unrestrict kZvOvCU0NNTgkrwo44Spn69VWlv5EfClNFOePbtmKdszhDhZ1BltrXzzZWeDO6t
 
