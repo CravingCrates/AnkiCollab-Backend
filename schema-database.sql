@@ -2,7 +2,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict kZvOvCU0NNTgkrwo44Spn69VWlv5EfClNFOePbtmKdszhDhZ1BltrXzzZWeDO6t
+\restrict mN9LMJYie2h1lV9nb2Q7OEhpUx6V7FdUk2jEqk7tx2268QA7LWBXLjMyWVKIdxK
 
 -- Dumped from database version 18.6 (Ubuntu 18.6-1.pgdg24.04+2)
 -- Dumped by pg_dump version 18.6 (Ubuntu 18.6-1.pgdg24.04+2)
@@ -878,9 +878,10 @@ CREATE TABLE anki.note_stats (
     user_hash character varying(64),
     retention integer,
     lapses integer,
-    reps integer
+    reps integer,
+    consent_version integer
 )
-WITH (autovacuum_vacuum_scale_factor='0.01', autovacuum_analyze_scale_factor='0.005');
+WITH (autovacuum_vacuum_scale_factor='0.01', autovacuum_analyze_scale_factor='0.005', fillfactor='60');
 
 
 ALTER TABLE anki.note_stats OWNER TO postgres;
@@ -1258,6 +1259,27 @@ CREATE TABLE public.device_pair_sessions (
 
 
 ALTER TABLE public.device_pair_sessions OWNER TO postgres;
+
+--
+-- Name: erasure_jobs; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.erasure_jobs (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    user_id integer NOT NULL,
+    deck_hash character varying(255) NOT NULL,
+    state text DEFAULT 'pending'::text NOT NULL,
+    attempts integer DEFAULT 0 NOT NULL,
+    requested_at timestamp with time zone DEFAULT now() NOT NULL,
+    next_attempt_at timestamp with time zone DEFAULT now() NOT NULL,
+    claimed_at timestamp with time zone,
+    last_error text,
+    finished_at timestamp with time zone,
+    CONSTRAINT erasure_jobs_state_check CHECK ((state = ANY (ARRAY['pending'::text, 'running'::text, 'done'::text, 'failed'::text])))
+);
+
+
+ALTER TABLE public.erasure_jobs OWNER TO postgres;
 
 --
 -- Name: passkey_credentials; Type: TABLE; Schema: public; Owner: postgres
@@ -1829,6 +1851,14 @@ ALTER TABLE ONLY public.device_pair_sessions
 
 
 --
+-- Name: erasure_jobs erasure_jobs_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.erasure_jobs
+    ADD CONSTRAINT erasure_jobs_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: passkey_credentials passkey_credentials_credential_id_key; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
@@ -2197,13 +2227,6 @@ CREATE INDEX "~note_move_suggestions-xx" ON anki.note_move_suggestions USING btr
 
 
 --
--- Name: ~notes-9fccd81c; Type: INDEX; Schema: anki; Owner: postgres
---
-
-CREATE INDEX "~notes-9fccd81c" ON anki.notes USING btree (id);
-
-
---
 -- Name: ~notes-a15a5c5f; Type: INDEX; Schema: anki; Owner: postgres
 --
 
@@ -2229,6 +2252,20 @@ CREATE INDEX "~notetype-6de94a39" ON anki.notetype USING btree (owner);
 --
 
 CREATE INDEX "~tags-baa66cc5" ON anki.tags USING btree (commit);
+
+
+--
+-- Name: erasure_jobs_active_uniq; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE UNIQUE INDEX erasure_jobs_active_uniq ON public.erasure_jobs USING btree (user_id, deck_hash) WHERE (state = ANY (ARRAY['pending'::text, 'running'::text]));
+
+
+--
+-- Name: erasure_jobs_claimable_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX erasure_jobs_claimable_idx ON public.erasure_jobs USING btree (requested_at) WHERE (state = ANY (ARRAY['pending'::text, 'running'::text]));
 
 
 --
@@ -2673,6 +2710,14 @@ ALTER TABLE ONLY public.device_pair_sessions
 
 
 --
+-- Name: erasure_jobs erasure_jobs_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.erasure_jobs
+    ADD CONSTRAINT erasure_jobs_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
 -- Name: passkey_credentials passkey_credentials_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
 --
 
@@ -2692,5 +2737,5 @@ GRANT ALL ON SCHEMA public TO PUBLIC;
 -- PostgreSQL database dump complete
 --
 
-\unrestrict kZvOvCU0NNTgkrwo44Spn69VWlv5EfClNFOePbtmKdszhDhZ1BltrXzzZWeDO6t
+\unrestrict mN9LMJYie2h1lV9nb2Q7OEhpUx6V7FdUk2jEqk7tx2268QA7LWBXLjMyWVKIdxK
 
