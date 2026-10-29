@@ -40,6 +40,7 @@ pub struct AppState {
     pub cache_base_url: Arc<String>,
     pub cache_token_replay_cache: Arc<Mutex<HashMap<String, (i64, u8)>>>,
     pub s3_throttle: Arc<S3Throttle>,
+    pub min_consent_version: i32,
 }
 
 pub type SharedConn =

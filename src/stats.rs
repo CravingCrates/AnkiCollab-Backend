@@ -15,6 +15,11 @@ pub async fn new(
     info: StatsInfo,
     user_hash: String,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Copied out before `info` is consumed by the loops below. `None` stays `None`:
+    // an upload that does not state a wording must not overwrite the provenance
+    // recorded by an earlier one that did.
+    let consent_version = info.consent_version;
+
     let mut client = match db_state.db_pool.get().await {
         Ok(pool) => pool,
         Err(err) => {
@@ -141,13 +146,21 @@ pub async fn new(
             "UPDATE note_stats ns
          SET retention = tu.retention,
              lapses = tu.lapses,
-             reps = tu.reps
+             reps = tu.reps,
+             consent_version = COALESCE($6::int, ns.consent_version)
          FROM (
              SELECT * FROM UNNEST($1::bigint[], $2::int[], $3::int[], $4::int[])
              AS t(note_id, retention, lapses, reps)
          ) tu
          WHERE ns.note_id = tu.note_id AND ns.user_hash = $5::varchar",
-            &[&note_ids, &retentions, &lapses, &reps, &user_hash],
+            &[
+                &note_ids,
+                &retentions,
+                &lapses,
+                &reps,
+                &user_hash,
+                &consent_version,
+            ],
         )
         .await?;
 
@@ -155,8 +168,8 @@ pub async fn new(
     // If all rows were updated, skip the insert
     if (update_count as usize) < note_ids.len() {
         tx.execute(
-            "INSERT INTO note_stats (note_id, user_hash, retention, lapses, reps)
-             SELECT tu.note_id, $5::varchar, tu.retention, tu.lapses, tu.reps
+            "INSERT INTO note_stats (note_id, user_hash, retention, lapses, reps, consent_version)
+             SELECT tu.note_id, $5::varchar, tu.retention, tu.lapses, tu.reps, $6::int
              FROM (
                  SELECT * FROM UNNEST($1::bigint[], $2::int[], $3::int[], $4::int[])
                  AS t(note_id, retention, lapses, reps)
@@ -165,7 +178,14 @@ pub async fn new(
                  SELECT 1 FROM note_stats ns 
                  WHERE ns.note_id = tu.note_id AND ns.user_hash = $5::varchar
              )",
-            &[&note_ids, &retentions, &lapses, &reps, &user_hash],
+            &[
+                &note_ids,
+                &retentions,
+                &lapses,
+                &reps,
+                &user_hash,
+                &consent_version,
+            ],
         )
         .await?;
     }

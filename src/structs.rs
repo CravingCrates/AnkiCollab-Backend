@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 // Anki Structs from the json export
 /* Notetypes */
@@ -160,10 +160,50 @@ pub struct NoteStatsInfo {
 type NoteReview = HashMap<String, NoteStatsInfo>; // HashMap<NoteGuid, NoteStatsInfo
 type DeckReview = HashMap<String, NoteReview>; // HashMap<DeckName, NoteReview>
 
+/// Consent wording the uploader agreed to.
+///
+/// Lenient on purpose. An older add-on omits the field, and a newer one may send
+/// something this server does not understand. Anything that is not a positive
+/// integer is treated as absent rather than rejected: failing the upload would
+/// stop a user's contribution over a field that exists only for provenance.
 #[derive(Deserialize)]
 pub struct StatsInfo {
+    #[serde(alias = "deckHash")]
     pub deck_hash: String,
     pub review_history: DeckReview,
+    #[serde(
+        default,
+        alias = "consentVersion",
+        deserialize_with = "lenient_consent_version"
+    )]
+    pub consent_version: Option<i32>,
+}
+
+fn lenient_consent_version<'de, D>(deserializer: D) -> Result<Option<i32>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value
+        .and_then(|value| value.as_i64())
+        .and_then(|version| i32::try_from(version).ok())
+        .filter(|version| *version > 0))
+}
+
+/// Body of `POST /DeleteDeckStats`.
+///
+/// Deliberately only `deck_hash`. The account whose statistics are erased comes
+/// from the bearer token, and serde ignores unknown fields, so a body carrying
+/// `user_id` / `userId` / `username` cannot influence the outcome.
+#[derive(Deserialize)]
+pub struct DeleteDeckStatsRequest {
+    #[serde(alias = "deckHash")]
+    pub deck_hash: String,
+}
+
+#[derive(Serialize)]
+pub struct ErasureStatusResponse {
+    pub status: &'static str,
 }
 
 #[derive(Deserialize)]

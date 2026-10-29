@@ -23,6 +23,7 @@ pub mod changelog;
 pub mod cleanser;
 pub mod contribution_stats;
 pub mod database;
+pub mod erasure;
 pub mod error;
 pub mod human_hash;
 pub mod inheritance;
@@ -571,9 +572,23 @@ pub async fn upload_deck_stats(
         );
     }
 
-    // Derive user_hash from authenticated user
-    let username = match auth::get_username_by_user_id(&state, auth_user.user_id).await {
-        Ok(u) => u,
+    // Below the configured floor the upload is dropped, not rejected: an old add-on
+    // cannot act on an error, and refusing would stop a user sharing anything at all.
+    // The floor is 0 by default, so this is inert until it is deliberately raised.
+    let consent_version = info.consent_version.unwrap_or(0);
+    if state.min_consent_version > 0 && consent_version < state.min_consent_version {
+        tracing::warn!(
+            user_id = auth_user.user_id,
+            deck_hash = %info.deck_hash,
+            consent_version,
+            min_consent_version = state.min_consent_version,
+            "Dropped deck stats upload below the minimum consent version"
+        );
+        return (StatusCode::OK, "Thanks for sharing!".to_string());
+    }
+
+    let user_hash = match auth::get_user_hash_by_user_id(&state, auth_user.user_id).await {
+        Ok(hash) => hash,
         Err(_) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -581,21 +596,14 @@ pub async fn upload_deck_stats(
             )
         }
     };
-    let user_hash = {
-        let mut hasher = Sha256::new();
-        hasher.update(username.as_bytes());
-        encode(hasher.finalize())
-    };
 
     let db_state_clone = Arc::clone(&state);
     let deck_hash_for_error = info.deck_hash.clone();
 
-    // Run on the Tokio runtime
     tokio::spawn(async move {
         match stats::new(&db_state_clone, info, user_hash).await {
             Ok(()) => {}
             Err(err) => {
-                // Stats insertion failure is usually not critical, but worth logging
                 error::AppError::operational(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "upload_deck_stats",
@@ -609,6 +617,54 @@ pub async fn upload_deck_stats(
     });
 
     (StatusCode::OK, "Thanks for sharing!".to_string())
+}
+
+pub async fn delete_deck_stats(
+    auth_user: AuthenticatedUser,
+    State(state): State<Arc<AppState>>,
+    body: String,
+) -> impl IntoResponse {
+    let request: structs::DeleteDeckStatsRequest = match serde_json::from_str(&body) {
+        Ok(request) => request,
+        Err(_) => {
+            return error::AppError::bad_request("delete_deck_stats", "Invalid request body")
+                .into_response();
+        }
+    };
+
+    let deck_hash = request.deck_hash.trim();
+    if deck_hash.is_empty() {
+        return error::AppError::bad_request("delete_deck_stats", "Missing deck_hash")
+            .into_response();
+    }
+
+    // The hash is deliberately not format-checked: a hash that names no deck the
+    // caller has data in is "nothing to delete", not a client error.
+    match erasure::schedule(&state, auth_user.user_id, deck_hash).await {
+        Ok(erasure::ScheduleOutcome::NothingToDelete) => (
+            StatusCode::OK,
+            Json(structs::ErasureStatusResponse {
+                status: "nothing_to_delete",
+            }),
+        )
+            .into_response(),
+        Ok(erasure::ScheduleOutcome::Scheduled) => {
+            // The job row is committed at this point. Nudging the worker is only an
+            // optimisation; the periodic tick would find the row regardless.
+            let worker_state = Arc::clone(&state);
+            tokio::spawn(async move {
+                erasure::process_pending_jobs(&worker_state).await;
+            });
+            (
+                StatusCode::ACCEPTED,
+                Json(structs::ErasureStatusResponse {
+                    status: "scheduled",
+                }),
+            )
+                .into_response()
+        }
+        Err(err) => err.into_response(),
+    }
 }
 
 pub async fn confirm_media_bulk_async(
@@ -1865,6 +1921,11 @@ async fn main() {
         rate_limiter_for_refresh.refresh_bucket_size(measured_bucket_size);
     });
 
+    let min_consent_version: i32 = std::env::var("MIN_CONSENT_VERSION")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+
     let state = Arc::new(database::AppState {
         db_pool: Arc::new(pool),
         base64_engine: Arc::new(general_purpose::STANDARD),
@@ -1878,6 +1939,7 @@ async fn main() {
         cache_base_url: media_base_url.clone(),
         cache_token_replay_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         s3_throttle: s3_throttle.clone(),
+        min_consent_version,
     });
 
     let run_startup_s3_cleanup = false; // <-- CHANGE TO true TO ENABLE STARTUP CLEANUP
@@ -1985,6 +2047,9 @@ async fn main() {
     // start media cleanup task
     media_manager::start_cleanup_task(state.clone());
 
+    // resumes any erasure that was queued before this process started
+    erasure::start_worker(state.clone());
+
     // start media token replay cache cleanup task
     media_proxy::start_token_cleanup_task(state.clone());
 
@@ -2068,6 +2133,12 @@ async fn main() {
                 )
                 .await
                 .expect("Error executing large decks statement 2");
+
+            match erasure::prune_finished(&client).await {
+                Ok(0) => {}
+                Ok(count) => println!("Pruned {count} finished erasure jobs"),
+                Err(err) => println!("Error pruning finished erasure jobs: {err}"),
+            }
         }
     });
 
@@ -2119,6 +2190,7 @@ async fn main() {
             "/UploadDeckStats",
             post(upload_deck_stats).layer(axum::extract::DefaultBodyLimit::max(50 * 1024 * 1024)),
         ) // 50 MB for stats
+        .route("/DeleteDeckStats", post(delete_deck_stats))
         .route("/requestRemoval", post(request_removal))
         .route("/GetNotifications", get(api_get_notifications))
         .route(
