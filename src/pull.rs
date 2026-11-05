@@ -602,3 +602,49 @@ pub async fn check_deck_alive(
 
     Ok(missing_hashes)
 }
+
+pub async fn get_deck_note_guids(
+    db_state: &Arc<database::AppState>,
+    deck_hashes: &[String],
+) -> Result<HashMap<String, Vec<String>>, Box<dyn std::error::Error + Send + Sync>> {
+    let client = match db_state.db_pool.get().await {
+        Ok(pool) => pool,
+        Err(err) => {
+            tracing::error!("Error getting db pool: {err}");
+            return Err("Failed to retrieve a pooled connection".into());
+        }
+    };
+
+    let stmt = client
+        .prepare(
+            "
+        WITH RECURSIVE deck_tree AS (
+            SELECT id, human_hash AS root_hash
+            FROM decks
+            WHERE human_hash = ANY($1)
+            UNION ALL
+            SELECT d.id, dt.root_hash
+            FROM decks d
+            INNER JOIN deck_tree dt ON d.parent = dt.id
+        )
+        SELECT DISTINCT dt.root_hash, n.guid
+        FROM deck_tree dt
+        LEFT JOIN notes n ON n.deck = dt.id AND n.deleted = false AND n.reviewed = true
+    ",
+        )
+        .await?;
+
+    let rows = client.query(&stmt, &[&deck_hashes]).await?;
+    let mut result: HashMap<String, Vec<String>> = HashMap::new();
+
+    for row in rows {
+        let root_hash: String = row.get("root_hash");
+        let guid: Option<String> = row.get("guid");
+        let guids = result.entry(root_hash).or_default();
+        if let Some(guid) = guid {
+            guids.push(guid);
+        }
+    }
+
+    Ok(result)
+}

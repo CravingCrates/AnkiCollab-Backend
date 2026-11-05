@@ -146,6 +146,11 @@ pub struct CheckDeckAliveRequest {
 }
 
 #[derive(Deserialize)]
+pub struct GetDeckNoteGuidsRequest {
+    pub deck_hashes: Vec<String>,
+}
+
+#[derive(Deserialize)]
 pub struct SubscriptionRequest {
     pub deck_hash: String,
 }
@@ -522,4 +527,83 @@ pub struct MyImpactStats {
     pub milestone: ImpactMilestone,
     pub latest_accepted: Option<ImpactLatestAccepted>,
     pub decks: Vec<ImpactDeck>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(body: &str) -> StatsInfo {
+        serde_json::from_str(body).expect("body should parse")
+    }
+
+    #[test]
+    fn consent_version_is_read_when_present() {
+        let info = parse(r#"{"deck_hash":"a-b-c","review_history":{},"consent_version":2}"#);
+        assert_eq!(info.consent_version, Some(2));
+    }
+
+    #[test]
+    fn consent_version_is_optional_for_older_clients() {
+        let info = parse(r#"{"deck_hash":"a-b-c","review_history":{}}"#);
+        assert_eq!(info.consent_version, None);
+    }
+
+    #[test]
+    fn unusable_consent_versions_are_treated_as_absent() {
+        for body in [
+            r#"{"deck_hash":"a-b-c","review_history":{},"consent_version":"two"}"#,
+            r#"{"deck_hash":"a-b-c","review_history":{},"consent_version":null}"#,
+            r#"{"deck_hash":"a-b-c","review_history":{},"consent_version":0}"#,
+            r#"{"deck_hash":"a-b-c","review_history":{},"consent_version":-1}"#,
+            r#"{"deck_hash":"a-b-c","review_history":{},"consent_version":2.5}"#,
+            r#"{"deck_hash":"a-b-c","review_history":{},"consent_version":99999999999}"#,
+        ] {
+            assert_eq!(parse(body).consent_version, None, "body: {body}");
+        }
+    }
+
+    #[test]
+    fn unknown_fields_do_not_break_the_upload() {
+        let info = parse(
+            r#"{"deck_hash":"a-b-c","review_history":{},"consent_version":2,"future_field":{"x":1}}"#,
+        );
+        assert_eq!(info.consent_version, Some(2));
+    }
+
+    #[test]
+    fn delete_body_cannot_name_a_user() {
+        let request: DeleteDeckStatsRequest = serde_json::from_str(
+            r#"{"deck_hash":"a-b-c","user_id":7,"userId":7,"username":"mallory"}"#,
+        )
+        .expect("unknown fields are ignored");
+        assert_eq!(request.deck_hash, "a-b-c");
+    }
+
+    #[test]
+    fn camel_case_spellings_are_accepted() {
+        let info = parse(r#"{"deckHash":"a-b-c","review_history":{},"consentVersion":2}"#);
+        assert_eq!(info.deck_hash, "a-b-c");
+        assert_eq!(info.consent_version, Some(2));
+
+        let request: DeleteDeckStatsRequest =
+            serde_json::from_str(r#"{"deckHash":"a-b-c"}"#).expect("alias should parse");
+        assert_eq!(request.deck_hash, "a-b-c");
+    }
+
+    #[test]
+    fn a_body_with_neither_spelling_is_still_rejected() {
+        assert!(serde_json::from_str::<DeleteDeckStatsRequest>(r#"{"hash":"a-b-c"}"#).is_err());
+    }
+
+    #[test]
+    fn get_deck_note_guids_request_parses_deck_hashes() {
+        let req: GetDeckNoteGuidsRequest =
+            serde_json::from_str(r#"{"deck_hashes":["ack-alabama-alanine","alpha-angel-apart"]}"#)
+                .expect("request should parse");
+        assert_eq!(
+            req.deck_hashes,
+            vec!["ack-alabama-alanine", "alpha-angel-apart"]
+        );
+    }
 }

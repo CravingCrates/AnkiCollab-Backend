@@ -62,8 +62,8 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use auth::AuthenticatedUser;
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
-    response::IntoResponse,
+    http::{header, HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
     routing::{get, post, Router},
     Json,
 };
@@ -205,7 +205,7 @@ fn decompress_data(engine: &general_purpose::GeneralPurpose, data: &str) -> Resu
     // Standard decoding path: base64 -> gzip -> UTF-8 JSON
     // Client sends: gzip.compress(json.dumps(data).encode('utf-8')) -> base64.b64encode()
 
-    const MAX_DECOMPRESSED_SIZE: u64 = 250 * 1024 * 1024; // 250 MB limit
+    const MAX_DECOMPRESSED_SIZE: u64 = 150 * 1024 * 1024; // 150 MB limit
 
     let trimmed = data.trim();
 
@@ -1141,6 +1141,126 @@ pub async fn check_deck_alive(
                 .with_context("deck_count", deck_hashes.len().to_string())
                 .report_to_sentry();
             (StatusCode::INTERNAL_SERVER_ERROR, "Error".to_string())
+        }
+    }
+}
+
+fn accepts_gzip(headers: &HeaderMap) -> bool {
+    for val in headers.get_all(header::ACCEPT_ENCODING) {
+        let Ok(s) = val.to_str() else { continue };
+        for part in s.split(',') {
+            let mut items = part.split(';');
+            let coding = items.next().unwrap_or("").trim();
+            if coding.eq_ignore_ascii_case("gzip") {
+                let mut is_zero_q = false;
+                for param in items {
+                    let param = param.trim();
+                    if let Some(q_val) = param
+                        .strip_prefix("q=")
+                        .or_else(|| param.strip_prefix("Q="))
+                    {
+                        let q_val = q_val.trim();
+                        if q_val == "0" || q_val == "0.0" || q_val == "0.00" || q_val == "0.000" {
+                            is_zero_q = true;
+                            break;
+                        }
+                    }
+                }
+                if !is_zero_q {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn encode_json_response(
+    headers: &HeaderMap,
+    json_bytes: Vec<u8>,
+) -> Result<Response, std::io::Error> {
+    if accepts_gzip(headers) {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(&json_bytes)?;
+        let compressed = encoder.finish()?;
+
+        Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::CONTENT_ENCODING, "gzip")
+            .header(header::VARY, "Accept-Encoding")
+            .body(axum::body::Body::from(compressed))
+            .expect("valid response builder"))
+    } else {
+        Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::VARY, "Accept-Encoding")
+            .body(axum::body::Body::from(json_bytes))
+            .expect("valid response builder"))
+    }
+}
+
+pub async fn get_deck_note_guids(
+    State(state): State<Arc<AppState>>,
+    _auth_user: AuthenticatedUser,
+    headers: HeaderMap,
+    Json(req): Json<structs::GetDeckNoteGuidsRequest>,
+) -> impl IntoResponse {
+    if req.deck_hashes.len() > 50 {
+        return (StatusCode::BAD_REQUEST, "Too many deck entries".to_string()).into_response();
+    }
+
+    if req.deck_hashes.is_empty() {
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from("{}"))
+            .expect("valid response builder");
+    }
+
+    for deck_hash in &req.deck_hashes {
+        if !validate_deck_hash(deck_hash) {
+            return (
+                StatusCode::BAD_REQUEST,
+                "Invalid deck hash format".to_string(),
+            )
+                .into_response();
+        }
+    }
+
+    match pull::get_deck_note_guids(&state, &req.deck_hashes).await {
+        Ok(res) => {
+            let json_bytes = match serde_json::to_vec(&res) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    error::AppError::bug(
+                        "get_deck_note_guids",
+                        format!("Serialization error: {err}"),
+                    )
+                    .report_to_sentry();
+                    return (StatusCode::INTERNAL_SERVER_ERROR, "Error".to_string())
+                        .into_response();
+                }
+            };
+
+            match encode_json_response(&headers, json_bytes) {
+                Ok(response) => response,
+                Err(err) => {
+                    error::AppError::bug(
+                        "get_deck_note_guids",
+                        format!("Compression error: {err}"),
+                    )
+                    .report_to_sentry();
+                    (StatusCode::INTERNAL_SERVER_ERROR, "Error".to_string()).into_response()
+                }
+            }
+        }
+        Err(err) => {
+            error::AppError::db_query("get_deck_note_guids", &err)
+                .with_context("deck_count", req.deck_hashes.len().to_string())
+                .report_to_sentry();
+            (StatusCode::INTERNAL_SERVER_ERROR, "Error".to_string()).into_response()
         }
     }
 }
@@ -2173,13 +2293,14 @@ async fn main() {
         .route("/pullChanges", post(check_for_update))
         .route(
             "/createDeck",
-            post(post_data).layer(axum::extract::DefaultBodyLimit::max(250 * 1024 * 1024)),
-        ) // 250 MB for deck creation CAVE Change line 205 too MAX_DECOMPRESSED_SIZE
+            post(post_data).layer(axum::extract::DefaultBodyLimit::max(150 * 1024 * 1024)),
+        ) // 150 MB for deck creation CAVE Change line 205 too MAX_DECOMPRESSED_SIZE
         .route(
             "/submitCard",
             post(process_card).layer(axum::extract::DefaultBodyLimit::max(100 * 1024 * 1024)),
         ) // 100 MB for card submission
         .route("/CheckDeckAlive", post(check_deck_alive))
+        .route("/GetDeckNoteGuids", post(get_deck_note_guids))
         .route("/AddSubscription", post(add_subscription))
         .route("/RemoveSubscription", post(remove_subscription))
         .route("/GetDeckTimestamp/{deck_hash}", get(get_deck_timestamp))
