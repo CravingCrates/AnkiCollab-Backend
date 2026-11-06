@@ -114,7 +114,7 @@ fn create_text_preview(bytes: &[u8], max_chars: usize) -> Option<String> {
 // Media file type constants
 pub(crate) const MAX_FILE_SIZE_BYTES: usize = 10 * 1024 * 1024; // 10 MB
 
-const EXTENSION_TO_MIME: [(&str, &str); 12] = [
+const EXTENSION_TO_MIME: [(&str, &str); 13] = [
     ("jpg", "image/jpeg"),
     ("jpeg", "image/jpeg"),
     ("png", "image/png"),
@@ -127,6 +127,7 @@ const EXTENSION_TO_MIME: [(&str, &str); 12] = [
     ("mp3", "audio/mpeg"),
     ("ogg", "audio/ogg"),
     ("oga", "audio/ogg"),
+    ("js", "text/javascript"),
 ];
 
 #[allow(dead_code)]
@@ -1944,7 +1945,7 @@ pub async fn confirm_media_bulk_upload(
             let validation_result = match s3_ops::get_object(&state, MEDIA_BUCKET.as_str(), &s3_key, None).await {
                 Ok(output) => {
                     // Validate the file content (signature and hash)
-                    match validate_media_stream(output.body, &file.hash).await {
+                    match validate_media_stream(output.body, &file.hash, &file.filename).await {
                         Ok(ContentValidationOutcome::Valid) => {
                             // File is valid
                             Ok(file)
@@ -2524,6 +2525,7 @@ enum ContentValidationOutcome {
 async fn validate_media_stream(
     byte_stream: ByteStream,
     expected_hash: &str,
+    filename: &str,
 ) -> Result<ContentValidationOutcome, Box<dyn std::error::Error + Send + Sync>> {
     let mut reader = byte_stream.into_async_read();
     let mut buffer = [0u8; 8192];
@@ -2552,7 +2554,16 @@ async fn validate_media_stream(
         });
     }
 
-    let detected = if let Some(media) = detect_supported_media(&content) {
+    let detected = if is_script_file(filename) {
+        // Scripts have no file signature and may contain "<svg", so skip media detection.
+        if std::str::from_utf8(&content).is_err() {
+            return Ok(ContentValidationOutcome::Invalid {
+                reason: "script_not_utf8",
+                mime: None,
+            });
+        }
+        DetectedMedia { is_svg: false }
+    } else if let Some(media) = detect_supported_media(&content) {
         media
     } else {
         let detected_mime = detect_mime(&content).unwrap_or("unknown").to_string();
@@ -2641,6 +2652,10 @@ pub(crate) fn determine_content_type_by_name(file_name: &str) -> Option<String> 
         .map(|(_, mime)| (*mime).to_string())
 }
 
+fn is_script_file(file_name: &str) -> bool {
+    determine_content_type_by_name(file_name).as_deref() == Some("text/javascript")
+}
+
 fn is_valid_media_hash(hash: &str) -> bool {
     hash.len() == 32
         && hash
@@ -2673,8 +2688,8 @@ enum FilenameRejectionReason {
 }
 
 fn check_filename_validity(filename: &str) -> Result<(), FilenameRejectionReason> {
-    const ALLOWED_EXTENSIONS: [&str; 11] = [
-        "jpg", "jpeg", "png", "gif", "webp", "svg", "bmp", "tif", "tiff", "mp3", "ogg",
+    const ALLOWED_EXTENSIONS: [&str; 12] = [
+        "jpg", "jpeg", "png", "gif", "webp", "svg", "bmp", "tif", "tiff", "mp3", "ogg", "js",
     ];
 
     // Minimum length 4 allows valid filenames like "a.png" (1 char + dot + 3 char extension)
@@ -3007,4 +3022,21 @@ pub async fn sanitize_svg_batch(
     }
 
     Ok(Json(SvgSanitizeResponse { sanitized_files }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn allows_js_files() {
+        assert!(is_allowed_extension("_amboss-deck-0.4.2.js"));
+        assert_eq!(
+            determine_content_type_by_name("_amboss-deck-0.4.2.js").as_deref(),
+            Some("text/javascript")
+        );
+        assert!(is_script_file("_anki-persistence.min.JS"));
+        assert!(!is_script_file("_anki-persistence.json"));
+        assert!(!is_script_file("image.svg"));
+    }
 }
