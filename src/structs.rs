@@ -242,6 +242,8 @@ pub struct MediaManifestResponse {
 pub struct MediaMissingFile {
     pub hash: String,
     pub note_id: i64,
+    #[serde(default)]
+    pub notetype_id: Option<i64>,
     pub filename: String,
     pub file_size: i64,
     #[serde(alias = "presigned_url")]
@@ -287,7 +289,10 @@ pub struct MediaBulkCheckRequest {
 pub struct MediaFileInfo {
     pub hash: String,
     pub filename: String,
+    #[serde(default)]
     pub note_guid: String,
+    #[serde(default)]
+    pub notetype_guid: Option<String>,
     pub file_size: i64,
 }
 
@@ -605,5 +610,38 @@ mod tests {
             req.deck_hashes,
             vec!["ack-alabama-alanine", "alpha-angel-apart"]
         );
+    }
+
+    #[test]
+    fn media_file_info_backwards_compatible() {
+        // Old client sending only note_guid
+        let json_old = r#"{"hash":"abc","filename":"test.png","note_guid":"g1","file_size":123}"#;
+        let info_old: MediaFileInfo = serde_json::from_str(json_old).unwrap();
+        assert_eq!(info_old.hash, "abc");
+        assert_eq!(info_old.note_guid, "g1");
+        assert_eq!(info_old.notetype_guid, None);
+
+        // New client sending notetype_guid and omitting note_guid
+        let json_nt =
+            r#"{"hash":"def","filename":"_test.css","notetype_guid":"nt1","file_size":456}"#;
+        let info_nt: MediaFileInfo = serde_json::from_str(json_nt).unwrap();
+        assert_eq!(info_nt.note_guid, "");
+        assert_eq!(info_nt.notetype_guid.as_deref(), Some("nt1"));
+    }
+
+    #[test]
+    fn media_missing_file_backwards_compatible() {
+        // Without notetype_id
+        let json_old = r#"{"hash":"abc","note_id":12,"filename":"img.png","file_size":100}"#;
+        let missing_old: MediaMissingFile = serde_json::from_str(json_old).unwrap();
+        assert_eq!(missing_old.note_id, 12);
+        assert_eq!(missing_old.notetype_id, None);
+
+        // With notetype_id
+        let json_nt =
+            r#"{"hash":"def","note_id":0,"notetype_id":34,"filename":"_f.woff","file_size":200}"#;
+        let missing_nt: MediaMissingFile = serde_json::from_str(json_nt).unwrap();
+        assert_eq!(missing_nt.note_id, 0);
+        assert_eq!(missing_nt.notetype_id, Some(34));
     }
 }

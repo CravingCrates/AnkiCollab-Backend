@@ -38,6 +38,52 @@ static SRC_REGEX: std::sync::LazyLock<Regex> =
 static LATEX_REGEX: std::sync::LazyLock<Regex> =
     std::sync::LazyLock::new(|| Regex::new(r"latex-image-\w+\.png").unwrap());
 
+static UNDERSCORED_CSS_IMPORTS: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+    Regex::new(r#"(?xi)(?:@import\s+"(_[^"]*\.css)"|'(_[^']*\.css)')|(?:url\(\s*"(_[^"]+)"|'(_[^']+)'|(_.+?)\s*\))"#).unwrap()
+});
+
+static UNDERSCORED_REFERENCES: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+    Regex::new(r#"(?x)\[sound:(_[^]]+)\]|"(_[^"]+)"|'(_[^']+)'|\b(?:src|data)=(_[^ >]+)"#).unwrap()
+});
+
+/// Extract static media references (prefixed with `_`) from notetype styling (`css`)
+/// and templates (`qfmt`, `afmt`), matching Anki's exact regex logic and filtered
+/// by allowed notetype extensions.
+#[must_use]
+pub fn extract_static_media_references(
+    css: &str,
+    templates: &[(String, String)],
+) -> HashSet<String> {
+    let mut references = HashSet::new();
+
+    let mut scan_text = |text: &str| {
+        for cap in UNDERSCORED_CSS_IMPORTS.captures_iter(text) {
+            if let Some(matched) = cap.iter().skip(1).find_map(|g| g).map(|m| m.as_str()) {
+                let trimmed = matched.trim();
+                if crate::media_manager::is_allowed_notetype_filename(trimmed) {
+                    references.insert(trimmed.to_string());
+                }
+            }
+        }
+        for cap in UNDERSCORED_REFERENCES.captures_iter(text) {
+            if let Some(matched) = cap.iter().skip(1).find_map(|g| g).map(|m| m.as_str()) {
+                let trimmed = matched.trim();
+                if crate::media_manager::is_allowed_notetype_filename(trimmed) {
+                    references.insert(trimmed.to_string());
+                }
+            }
+        }
+    };
+
+    scan_text(css);
+    for (qfmt, afmt) in templates {
+        scan_text(qfmt);
+        scan_text(afmt);
+    }
+
+    references
+}
+
 /// Extract all media references from a field content string as anki does
 #[must_use]
 pub fn extract_media_references(field_content: &str) -> HashSet<String> {
@@ -525,8 +571,153 @@ pub async fn get_missing_media(
         missing_media.extend(batch_missing_media);
     }
 
+    // Also find distinct notetype IDs used by non-deleted notes in the deck tree
+    // and extract static media references (css and templates) to find any missing files
+    let notetypes_query = client
+        .query(
+            "WITH RECURSIVE deck_tree AS (
+                SELECT id FROM decks WHERE human_hash = $1
+                UNION ALL
+                SELECT d.id FROM decks d
+                JOIN deck_tree dt ON d.parent = dt.id
+            )
+            SELECT DISTINCT n.notetype, nt.css
+            FROM notes n
+            JOIN notetype nt ON nt.id = n.notetype
+            WHERE n.deck IN (SELECT id FROM deck_tree) AND NOT n.deleted",
+            &[&deck_hash],
+        )
+        .await?;
+
+    if !notetypes_query.is_empty() {
+        let notetype_ids: Vec<i64> = notetypes_query.iter().map(|row| row.get(0)).collect();
+
+        let templates_rows = client
+            .query(
+                "SELECT notetype, qfmt, afmt FROM notetype_template WHERE notetype = ANY($1) ORDER BY position",
+                &[&notetype_ids],
+            )
+            .await?;
+
+        let mut templates_map: HashMap<i64, Vec<(String, String)>> = HashMap::new();
+        for row in templates_rows {
+            let nt_id: i64 = row.get(0);
+            let qfmt: String = row.get(1);
+            let afmt: String = row.get(2);
+            templates_map.entry(nt_id).or_default().push((qfmt, afmt));
+        }
+
+        let existing_refs_rows = client
+            .query(
+                "SELECT notetype_id, file_name FROM notetype_media_references WHERE notetype_id = ANY($1)",
+                &[&notetype_ids],
+            )
+            .await?;
+
+        let mut existing_refs_map: HashMap<i64, HashSet<String>> = HashMap::new();
+        for row in existing_refs_rows {
+            let nt_id: i64 = row.get(0);
+            let file_name: String = row.get(1);
+            existing_refs_map
+                .entry(nt_id)
+                .or_default()
+                .insert(file_name);
+        }
+
+        for row in notetypes_query {
+            let nt_id: i64 = row.get(0);
+            let css: String = row.get::<_, Option<String>>(1).unwrap_or_default();
+            let templates = templates_map.get(&nt_id).map_or(&[][..], Vec::as_slice);
+            let existing_refs = existing_refs_map.get(&nt_id).cloned().unwrap_or_default();
+
+            let static_refs = extract_static_media_references(&css, templates);
+            for missing in static_refs.difference(&existing_refs) {
+                missing_media.insert(missing.clone());
+            }
+        }
+    }
+
     // Convert HashSet to Vec for the final result to make serde stop bitching
     let missing_media_vec: Vec<String> = missing_media.into_iter().collect();
 
     Ok(missing_media_vec)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_static_media_css_imports() {
+        let css = r#"
+            @import "_style1.css";
+            @import '_style2.css';
+            @import "_invalid.exe";
+            @import "no_underscore.css";
+        "#;
+        let templates = [];
+        let refs = extract_static_media_references(css, &templates);
+        assert!(refs.contains("_style1.css"));
+        assert!(refs.contains("_style2.css"));
+        assert!(!refs.contains("_invalid.exe"));
+        assert!(!refs.contains("no_underscore.css"));
+    }
+
+    #[test]
+    fn test_extract_static_media_css_urls() {
+        let css = r#"
+            @font-face {
+                font-family: 'CustomFont';
+                src: url("_font1.woff2") format('woff2'),
+                     url('_font2.woff') format('woff'),
+                     url(_font3.ttf) format('truetype');
+            }
+            .icon { background-image: url("_icon.png"); }
+            .other { background-image: url("normal.png"); }
+        "#;
+        let templates = [];
+        let refs = extract_static_media_references(css, &templates);
+        assert!(refs.contains("_font1.woff2"));
+        assert!(refs.contains("_font2.woff"));
+        assert!(refs.contains("_font3.ttf"));
+        assert!(refs.contains("_icon.png"));
+        assert!(!refs.contains("normal.png"));
+    }
+
+    #[test]
+    fn test_extract_static_media_templates() {
+        let css = "";
+        let templates = vec![
+            (
+                r#"<script src="_bundle.js"></script><div class="card">{{Front}}</div>"#
+                    .to_string(),
+                r#"{{FrontSide}}<hr><img src="_back_img.svg">[sound:_pronounce.mp3]"#.to_string(),
+            ),
+            (
+                r#"<audio data="_sound2.ogg"></audio>"#.to_string(),
+                r#"<a href="https://example.com" target="_blank">Link</a>"#.to_string(),
+            ),
+        ];
+        let refs = extract_static_media_references(css, &templates);
+        assert!(refs.contains("_bundle.js"));
+        assert!(refs.contains("_back_img.svg"));
+        assert!(refs.contains("_pronounce.mp3"));
+        assert!(refs.contains("_sound2.ogg"));
+        // _blank must NOT be included because it lacks a valid allowed extension
+        assert!(!refs.contains("_blank"));
+    }
+
+    #[test]
+    fn test_extract_static_media_ignores_non_files() {
+        let css = "body { margin: 0; }";
+        let templates = vec![(
+            r#"var x = "_self"; var y = "_top"; var z = "_blank";"#.to_string(),
+            r#"<span class="_custom_class">test</span>"#.to_string(),
+        )];
+        let refs = extract_static_media_references(css, &templates);
+        assert!(
+            refs.is_empty(),
+            "Should not extract non-file string literals"
+        );
+    }
 }

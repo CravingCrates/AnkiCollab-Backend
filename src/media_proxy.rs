@@ -163,6 +163,8 @@ pub(crate) async fn download_media_file(
             "Access-Control-Allow-Headers",
             "Content-Type, Authorization",
         )
+        .header("X-Content-Type-Options", "nosniff")
+        .header("Content-Security-Policy", "default-src 'none'; sandbox")
         .body(body)
         .map_err(|err| {
             sentry::with_scope(
@@ -243,7 +245,9 @@ pub(crate) async fn upload_media_file(
         )
     })?;
 
-    if expected_size_usize > MAX_FILE_SIZE_BYTES {
+    let max_allowed = crate::media_manager::max_file_size_for_filename(&filename, true)
+        .unwrap_or(MAX_FILE_SIZE_BYTES);
+    if expected_size_usize > max_allowed {
         return Err((
             StatusCode::PAYLOAD_TOO_LARGE,
             "File exceeds maximum size".to_string(),

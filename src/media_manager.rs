@@ -27,9 +27,9 @@ use crate::media_tokens::{DownloadTokenParams, UploadTokenParams};
 use crate::s3_ops;
 use crate::structs::{
     MediaBulkCheckRequest, MediaBulkCheckResponse, MediaBulkConfirmRequest,
-    MediaBulkConfirmResponse, MediaDownloadItem, MediaExistingFile, MediaManifestRequest,
-    MediaManifestResponse, MediaMissingFile, MediaProcessedFile, SanitizedSvgItem,
-    SvgSanitizeRequest, SvgSanitizeResponse,
+    MediaBulkConfirmResponse, MediaDownloadItem, MediaExistingFile, MediaFileInfo,
+    MediaManifestRequest, MediaManifestResponse, MediaMissingFile, MediaProcessedFile,
+    SanitizedSvgItem, SvgSanitizeRequest, SvgSanitizeResponse,
 };
 use crate::{media_reference_manager, AppState};
 
@@ -113,8 +113,10 @@ fn create_text_preview(bytes: &[u8], max_chars: usize) -> Option<String> {
 
 // Media file type constants
 pub(crate) const MAX_FILE_SIZE_BYTES: usize = 10 * 1024 * 1024; // 10 MB
+pub(crate) const MAX_STATIC_CODE_SIZE_BYTES: usize = 1024 * 1024; // 1 MB
+pub(crate) const MAX_FONT_SIZE_BYTES: usize = 3 * 1024 * 1024; // 3 MB
 
-const EXTENSION_TO_MIME: [(&str, &str); 12] = [
+const EXTENSION_TO_MIME: [(&str, &str); 18] = [
     ("jpg", "image/jpeg"),
     ("jpeg", "image/jpeg"),
     ("png", "image/png"),
@@ -127,6 +129,12 @@ const EXTENSION_TO_MIME: [(&str, &str); 12] = [
     ("mp3", "audio/mpeg"),
     ("ogg", "audio/ogg"),
     ("oga", "audio/ogg"),
+    ("js", "application/javascript"),
+    ("css", "text/css"),
+    ("ttf", "font/ttf"),
+    ("otf", "font/otf"),
+    ("woff", "font/woff"),
+    ("woff2", "font/woff2"),
 ];
 
 #[allow(dead_code)]
@@ -802,11 +810,12 @@ pub async fn cleanup_orphaned_media(state: Arc<AppState>) -> Result<(), (StatusC
         )
     })?;
 
-    // Find orphaned media files (not referenced in media_references)
+    // Find orphaned media files (not referenced in media_references or notetype_media_references)
     let orphaned_files = tx
         .query(
             "SELECT id, hash FROM media_files m
-         WHERE NOT EXISTS (SELECT 1 FROM media_references r WHERE r.media_id = m.id)",
+         WHERE NOT EXISTS (SELECT 1 FROM media_references r WHERE r.media_id = m.id)
+           AND NOT EXISTS (SELECT 1 FROM notetype_media_references nr WHERE nr.media_id = m.id)",
             &[],
         )
         .await
@@ -950,7 +959,7 @@ pub fn start_cleanup_task(state: Arc<AppState>) {
                                 let id: i64 = row.get(0);
                                 let hash: String = row.get(1);
                                 let note_id = client.query_opt(
-                                    "SELECT id FROM media_references WHERE media_id = $1 LIMIT 1",
+                                    "SELECT id FROM media_references WHERE media_id = $1 UNION ALL SELECT id FROM notetype_media_references WHERE media_id = $1 LIMIT 1",
                                     &[&id]
                                 ).await.unwrap();
                                 if note_id.is_none() {
@@ -1041,16 +1050,43 @@ pub async fn check_media_bulk(
         ));
     }
 
+    let has_notetype_files = req
+        .files
+        .iter()
+        .any(|f| f.notetype_guid.as_deref().is_some_and(|g| !g.is_empty()));
+    if let Some(bulk_id) = &req.bulk_operation_id {
+        if !bulk_id.is_empty() && has_notetype_files {
+            wait_for_bulk_operation_completion(&state, bulk_id).await?;
+        }
+    }
+
     let mut invalid_files = Vec::new();
-    let mut valid_files = Vec::new();
-    // basic check if the files are valid with is_allowed_extension
+    let mut valid_note_files = Vec::new();
+    let mut valid_notetype_files = Vec::new();
+
     for file in req.files {
-        if is_allowed_extension_with_logging(&file.filename, i64::from(user_id))
-            && is_valid_media_hash(&file.hash)
-        {
-            valid_files.push(file);
+        if file.notetype_guid.as_deref().is_some_and(|g| !g.is_empty()) {
+            let max_size = max_file_size_for_filename(&file.filename, true);
+            let size_valid =
+                max_size.is_some_and(|max| file.file_size > 0 && (file.file_size as usize) <= max);
+            if size_valid
+                && check_notetype_filename_validity(&file.filename).is_ok()
+                && is_valid_media_hash(&file.hash)
+            {
+                valid_notetype_files.push(file);
+            } else {
+                invalid_files.push(file);
+            }
         } else {
-            invalid_files.push(file);
+            let size_valid = file.file_size > 0 && (file.file_size as usize) <= MAX_FILE_SIZE_BYTES;
+            if size_valid
+                && is_allowed_extension_with_logging(&file.filename, i64::from(user_id))
+                && is_valid_media_hash(&file.hash)
+            {
+                valid_note_files.push(file);
+            } else {
+                invalid_files.push(file);
+            }
         }
     }
 
@@ -1091,9 +1127,128 @@ pub async fn check_media_bulk(
         )
     })?;
 
+    let deck_owner: Option<i32> = tx
+        .query_opt(
+            "SELECT owner FROM decks WHERE human_hash = $1",
+            &[&req.deck_hash],
+        )
+        .await
+        .map_err(|err| {
+            sentry::capture_message(
+                &format!("check_media_bulk: Failed to query deck owner: {err}"),
+                sentry::Level::Error,
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal error".to_string(),
+            )
+        })?
+        .and_then(|row| row.get(0));
+
+    let mut verified_notetype_files: Vec<(MediaFileInfo, i64)> = Vec::new();
+    if !valid_notetype_files.is_empty() {
+        let notetype_guids: Vec<&str> = valid_notetype_files
+            .iter()
+            .filter_map(|f| f.notetype_guid.as_deref())
+            .collect();
+
+        let notetype_rows = tx
+            .query(
+                "WITH RECURSIVE deck_tree AS (
+                    SELECT id FROM decks WHERE human_hash = $1
+                    UNION ALL
+                    SELECT d.id FROM decks d
+                    INNER JOIN deck_tree dt ON dt.id = d.parent
+                )
+                SELECT nt.id, nt.guid, nt.owner, nt.css
+                FROM notetype nt
+                WHERE nt.guid = ANY($2)
+                  AND (
+                    (nt.owner IS NOT NULL AND nt.owner = $3)
+                    OR nt.id IN (
+                        SELECT DISTINCT n.notetype
+                        FROM notes n
+                        WHERE n.deck IN (SELECT id FROM deck_tree)
+                          AND n.deleted = false
+                    )
+                  )",
+                &[&req.deck_hash, &notetype_guids, &deck_owner],
+            )
+            .await
+            .map_err(|err| {
+                sentry::capture_message(
+                    &format!("check_media_bulk: Failed to query notetypes: {err}"),
+                    sentry::Level::Error,
+                );
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Internal error".to_string(),
+                )
+            })?;
+
+        let notetype_ids: Vec<i64> = notetype_rows.iter().map(|r| r.get::<_, i64>(0)).collect();
+
+        let mut notetype_templates_map: HashMap<i64, Vec<(String, String)>> = HashMap::new();
+        if !notetype_ids.is_empty() {
+            let template_rows = tx
+                .query(
+                    "SELECT notetype, qfmt, afmt FROM notetype_template WHERE notetype = ANY($1) ORDER BY position",
+                    &[&notetype_ids],
+                )
+                .await
+                .map_err(|err| {
+                    sentry::capture_message(
+                        &format!("check_media_bulk: Failed to query notetype templates: {err}"),
+                        sentry::Level::Error,
+                    );
+                    (StatusCode::INTERNAL_SERVER_ERROR, "Internal error".to_string())
+                })?;
+
+            for row in template_rows {
+                let nt_id: i64 = row.get(0);
+                let qfmt: String = row.get(1);
+                let afmt: String = row.get(2);
+                notetype_templates_map
+                    .entry(nt_id)
+                    .or_default()
+                    .push((qfmt, afmt));
+            }
+        }
+
+        let mut notetype_info_by_guid: HashMap<String, (i64, Option<i32>, HashSet<String>)> =
+            HashMap::new();
+        for row in notetype_rows {
+            let id: i64 = row.get(0);
+            let guid: String = row.get(1);
+            let owner: Option<i32> = row.get(2);
+            let css: String = row.get::<_, Option<String>>(3).unwrap_or_default();
+            let templates = notetype_templates_map
+                .get(&id)
+                .map_or(&[][..], Vec::as_slice);
+            let static_refs =
+                media_reference_manager::extract_static_media_references(&css, templates);
+            notetype_info_by_guid.insert(guid, (id, owner, static_refs));
+        }
+
+        for file in valid_notetype_files {
+            let guid = file.notetype_guid.as_deref().unwrap();
+            if let Some((nt_id, nt_owner, static_refs)) = notetype_info_by_guid.get(guid) {
+                let is_authorized = deck_owner.is_some_and(|o| o == user_id)
+                    || nt_owner.is_some_and(|o| o == user_id);
+                if is_authorized && static_refs.contains(&file.filename) {
+                    verified_notetype_files.push((file, *nt_id));
+                } else {
+                    invalid_files.push(file);
+                }
+            } else {
+                invalid_files.push(file);
+            }
+        }
+    }
+
     // Get all note IDs that are in the deck or its descendants,
     // OR are part of ongoing bulk operations
-    let note_guids: Vec<&str> = valid_files
+    let note_guids: Vec<&str> = valid_note_files
         .iter()
         .map(|file| file.note_guid.as_str())
         .collect();
@@ -1157,14 +1312,19 @@ pub async fn check_media_bulk(
         }
     }
 
-    // Get a list of all file hashes for checking existence
-    let hashes: Vec<String> = valid_files.iter().map(|file| file.hash.clone()).collect();
-
     // Check which files already exist in the database
+    let mut all_hashes: Vec<String> = valid_note_files
+        .iter()
+        .map(|file| file.hash.clone())
+        .collect();
+    for (file, _) in &verified_notetype_files {
+        all_hashes.push(file.hash.clone());
+    }
+
     let existing_files = tx
         .query(
             "SELECT id, hash FROM media_files WHERE hash = ANY($1)",
-            &[&hashes],
+            &[&all_hashes],
         )
         .await
         .map_err(|err| {
@@ -1188,23 +1348,8 @@ pub async fn check_media_bulk(
         existing_media_ids_map.insert(hash, id);
     }
 
-    // Collect note_id and filename pairs for files that already exist and have valid notes
-    let mut existing_file_note_pairs: Vec<(i64, String)> = Vec::new();
-    for hash in existing_media_ids_map.keys() {
-        for file in &valid_files {
-            if file.hash == *hash {
-                if let Some(&note_id) = note_id_map.get(&file.note_guid) {
-                    // Skip bulk operation notes (ID -1) as they don't exist in DB yet
-                    if note_id != -1 {
-                        existing_file_note_pairs.push((note_id, file.filename.clone()));
-                    }
-                }
-            }
-        }
-    }
-
     // we need a map of (note_id, filename) of all valid files to resolve ownership
-    let nid_filename_map = valid_files
+    let nid_filename_map = valid_note_files
         .iter()
         .filter_map(|file| {
             if let Some(&note_id) = note_id_map.get(&file.note_guid) {
@@ -1243,7 +1388,7 @@ pub async fn check_media_bulk(
 
     // Insert references for existing files using resolved ownership
     for (hash, media_id) in &existing_media_ids_map {
-        for file in &valid_files {
+        for file in &valid_note_files {
             if file.hash == *hash {
                 let try_note_id = note_id_map.get(&file.note_guid);
                 if try_note_id.is_none() {
@@ -1285,22 +1430,47 @@ pub async fn check_media_bulk(
         }
     }
 
-    // Prepare lists of existing and missing files
-    let mut existing_files_response = Vec::new();
-    let mut missing_files_response = Vec::new();
-
-    let mut invalid_hash_set = HashSet::new();
+    // Insert notetype references for existing hashes
+    for (file, nt_id) in &verified_notetype_files {
+        if let Some(&media_id) = existing_media_ids_map.get(&file.hash) {
+            tx.execute(
+                "INSERT INTO notetype_media_references (media_id, notetype_id, file_name)
+                 VALUES ($1, $2, $3)
+                 ON CONFLICT (notetype_id, file_name) DO UPDATE SET media_id = EXCLUDED.media_id",
+                &[&media_id, nt_id, &file.filename],
+            )
+            .await
+            .map_err(|err| {
+                sentry::capture_message(
+                    &format!(
+                        "check_media_bulk: Failed to insert notetype media reference for file {}: {err}",
+                        file.filename
+                    ),
+                    sentry::Level::Error,
+                );
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Internal error".to_string(),
+                )
+            })?;
+        }
+    }
 
     // Calculate total potential storage cost
-    let total_potential_bytes: u64 = valid_files.iter()
-    .map(|f| // file size of the file.hash not in existing_media_ids_map
-        if existing_media_ids_map.contains_key(&f.hash) {
-            0
-        } else {
-            f.file_size as u64
-        })
-    .sum();
-    let potential_file_count = valid_files.len() - existing_media_ids_map.len();
+    let mut total_potential_bytes: u64 = 0;
+    let mut potential_file_count: usize = 0;
+    for file in &valid_note_files {
+        if !existing_media_ids_map.contains_key(&file.hash) {
+            total_potential_bytes += file.file_size as u64;
+            potential_file_count += 1;
+        }
+    }
+    for (file, _) in &verified_notetype_files {
+        if !existing_media_ids_map.contains_key(&file.hash) {
+            total_potential_bytes += file.file_size as u64;
+            potential_file_count += 1;
+        }
+    }
 
     // check user-specific quota
     if !state
@@ -1325,8 +1495,13 @@ pub async fn check_media_bulk(
         ));
     }
 
-    // Generate presigned URLs for each missing file
-    for file in &valid_files {
+    // Prepare lists of existing and missing files
+    let mut existing_files_response = Vec::new();
+    let mut missing_files_response = Vec::new();
+    let mut invalid_hash_set = HashSet::new();
+
+    // Process note files
+    for file in &valid_note_files {
         if let Some(&media_id) = existing_media_ids_map.get(&file.hash) {
             existing_files_response.push(MediaExistingFile {
                 hash: file.hash.clone(),
@@ -1335,10 +1510,9 @@ pub async fn check_media_bulk(
         } else {
             let note_id = if let Some(&nid) = note_id_map.get(&file.note_guid) {
                 if nid == -1 {
-                    // Bulk operation note; use placeholder ID
                     -1
                 } else {
-                    ownership_map // Get true owner for the file (differs for inherited notes)
+                    ownership_map
                         .get(&(nid, file.filename.clone()))
                         .copied()
                         .unwrap_or(nid)
@@ -1354,40 +1528,19 @@ pub async fn check_media_bulk(
                     level: sentry::Level::Warning,
                     ..Default::default()
                 });
-                continue; // Skip if note ID is not found
+                continue;
             };
-
-            // Note is valid if it exists in DB (note_id > 0) or is part of bulk operation (note_id == -1)
 
             if file.file_size <= 0 || file.file_size > MAX_FILE_SIZE_BYTES as i64 {
                 invalid_hash_set.insert(file.hash.clone());
-                sentry::add_breadcrumb(sentry::Breadcrumb {
-                    category: Some("media_upload".into()),
-                    message: Some(format!(
-                        "Invalid file size for {} (size: {}, user: {})",
-                        file.filename, file.file_size, user_id
-                    )),
-                    level: sentry::Level::Warning,
-                    ..Default::default()
-                });
-                continue; // Skip if file size is invalid
+                continue;
             }
 
             if determine_content_type_by_name(&file.filename).is_none() {
                 invalid_hash_set.insert(file.hash.clone());
-                sentry::add_breadcrumb(sentry::Breadcrumb {
-                    category: Some("media_upload".into()),
-                    message: Some(format!(
-                        "Invalid content type for {} (user: {})",
-                        file.filename, user_id
-                    )),
-                    level: sentry::Level::Warning,
-                    ..Default::default()
-                });
-                continue; // Skip if content type is invalid
+                continue;
             }
 
-            // Log attempted file upload
             media_logger::log_media_operation(
                 &tx,
                 MediaOperationType::Upload,
@@ -1398,13 +1551,25 @@ pub async fn check_media_bulk(
                 Some(file.file_size),
             )
             .await
-            .unwrap();
+            .map_err(|err| {
+                sentry::capture_message(
+                    &format!(
+                        "check_media_bulk: Failed to log media operation for user {user_id}: {err}"
+                    ),
+                    sentry::Level::Error,
+                );
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Internal error".to_string(),
+                )
+            })?;
 
             let missing_file = MediaMissingFile {
                 hash: file.hash.clone(),
                 filename: file.filename.clone(),
                 note_id,
-                file_size: file.file_size, // Store the file size
+                notetype_id: None,
+                file_size: file.file_size,
                 upload_url: None,
             };
 
@@ -1412,12 +1577,69 @@ pub async fn check_media_bulk(
         }
     }
 
-    for file in &valid_files {
+    // Process verified notetype files
+    for (file, nt_id) in &verified_notetype_files {
+        if let Some(&media_id) = existing_media_ids_map.get(&file.hash) {
+            existing_files_response.push(MediaExistingFile {
+                hash: file.hash.clone(),
+                media_id,
+            });
+        } else {
+            if determine_content_type_by_name(&file.filename).is_none() {
+                invalid_hash_set.insert(file.hash.clone());
+                continue;
+            }
+
+            media_logger::log_media_operation(
+                &tx,
+                MediaOperationType::Upload,
+                Some(user_id),
+                ip_address,
+                Some(file.hash.clone()),
+                Some(file.filename.clone()),
+                Some(file.file_size),
+            )
+            .await
+            .map_err(|err| {
+                sentry::capture_message(
+                    &format!(
+                        "check_media_bulk: Failed to log media operation for user {user_id}: {err}"
+                    ),
+                    sentry::Level::Error,
+                );
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Internal error".to_string(),
+                )
+            })?;
+
+            let missing_file = MediaMissingFile {
+                hash: file.hash.clone(),
+                filename: file.filename.clone(),
+                note_id: 0,
+                notetype_id: Some(*nt_id),
+                file_size: file.file_size,
+                upload_url: None,
+            };
+
+            missing_files_response.push(missing_file);
+        }
+    }
+
+    for file in &valid_note_files {
         if invalid_hash_set.contains(&file.hash) {
             invalid_files.push(file.clone());
         }
     }
-    valid_files.retain(|file| !invalid_hash_set.contains(&file.hash));
+    for (file, _) in &verified_notetype_files {
+        if invalid_hash_set.contains(&file.hash) {
+            invalid_files.push(file.clone());
+        }
+    }
+
+    // Deduplicate existing_files_response by hash
+    existing_files_response.sort_by(|a, b| a.hash.cmp(&b.hash));
+    existing_files_response.dedup_by(|a, b| a.hash == b.hash);
 
     // Store metadata about missing files for later confirmation
     let mut batch_id = None;
@@ -1871,7 +2093,11 @@ pub async fn confirm_media_bulk_upload(
         .iter()
         .filter(|f| {
             confirmed_hashes.contains(&f.hash)
-                && is_allowed_extension(&f.filename)
+                && (if f.notetype_id.is_some() {
+                    is_allowed_notetype_filename(&f.filename)
+                } else {
+                    is_allowed_extension(&f.filename)
+                })
                 && is_valid_media_hash(&f.hash)
         })
         .collect();
@@ -1910,8 +2136,11 @@ pub async fn confirm_media_bulk_upload(
                     let actual_size_f64 = actual_size as f64;
                     let file_size_f64 = file.file_size as f64;
 
+                    let max_allowed = max_file_size_for_filename(&file.filename, file.notetype_id.is_some())
+                        .unwrap_or(MAX_FILE_SIZE_BYTES);
+
                     // Validate file size (within 1% tolerance)
-                    let size_invalid = actual_size > MAX_FILE_SIZE_BYTES as i64
+                    let size_invalid = actual_size > max_allowed as i64
                         || actual_size == 0
                         || actual_size_f64 > file_size_f64 * 1.01
                         || actual_size_f64 < file_size_f64 * 0.99;
@@ -1944,7 +2173,7 @@ pub async fn confirm_media_bulk_upload(
             let validation_result = match s3_ops::get_object(&state, MEDIA_BUCKET.as_str(), &s3_key, None).await {
                 Ok(output) => {
                     // Validate the file content (signature and hash)
-                    match validate_media_stream(output.body, &file.hash).await {
+                    match validate_media_stream(&file.filename, file.notetype_id.is_some(), output.body, &file.hash).await {
                         Ok(ContentValidationOutcome::Valid) => {
                             // File is valid
                             Ok(file)
@@ -2108,19 +2337,145 @@ pub async fn confirm_media_bulk_upload(
         )
     })?;
 
-    // Separate validated files by whether they have known note_ids
+    // Separate validated files into notetypes, known notes, and unknown notes
+    let mut files_with_notetypes = Vec::new();
     let mut files_with_known_notes = Vec::new();
     let mut files_with_unknown_notes = Vec::new();
 
     for file in &validated_files {
-        if file.note_id == -1 {
-            files_with_unknown_notes.push(file);
-        } else {
-            files_with_known_notes.push(file);
+        if file.notetype_id.is_some_and(|id| id > 0) {
+            files_with_notetypes.push(*file);
+        } else if file.notetype_id.is_none() && file.note_id > 0 {
+            files_with_known_notes.push(*file);
+        } else if file.notetype_id.is_none() && file.note_id == -1 {
+            files_with_unknown_notes.push(*file);
         }
     }
 
     let mut actual_bytes_stored: u64 = 0;
+
+    // Process files with notetypes
+    for file in files_with_notetypes {
+        let notetype_id = file.notetype_id.unwrap();
+
+        // Verify notetype exists
+        let notetype_valid = tx
+            .query_opt("SELECT id FROM notetype WHERE id = $1", &[&notetype_id])
+            .await
+            .map_err(|err| {
+                sentry::capture_message(
+                    &format!(
+                        "confirm_media_bulk_upload: Failed to query notetype {notetype_id} for file {}: {err}",
+                        file.filename
+                    ),
+                    sentry::Level::Error,
+                );
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Internal error".to_string(),
+                )
+            })?
+            .is_some();
+
+        if !notetype_valid {
+            sentry::add_breadcrumb(sentry::Breadcrumb {
+                category: Some("media_upload".into()),
+                message: Some(format!(
+                    "Invalid notetype reference for file {}: notetype_id {notetype_id}",
+                    file.filename
+                )),
+                level: sentry::Level::Warning,
+                ..Default::default()
+            });
+            processed_files.push(MediaProcessedFile {
+                hash: file.hash.clone(),
+                media_id: 0,
+                success: false,
+                error: Some("Invalid notetype reference".to_string()),
+            });
+            continue;
+        }
+
+        // Get existing media_id from database
+        let media_id_opt = tx
+            .query_opt("SELECT id FROM media_files WHERE hash = $1", &[&file.hash])
+            .await
+            .map_err(|err| {
+                sentry::capture_message(
+                    &format!(
+                        "confirm_media_bulk_upload: Failed to query media file for hash {}: {err}",
+                        file.hash
+                    ),
+                    sentry::Level::Error,
+                );
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Internal error".to_string(),
+                )
+            })?;
+
+        let media_id = match media_id_opt {
+            Some(row) => row.get::<_, i64>(0),
+            None => tx
+                .query_one(
+                    "INSERT INTO media_files (hash, file_size)
+                     VALUES ($1, $2)
+                     ON CONFLICT (hash) DO UPDATE SET file_size = EXCLUDED.file_size
+                     RETURNING id",
+                    &[&file.hash, &file.file_size],
+                )
+                .await
+                .map_err(|err| {
+                    sentry::capture_message(
+                        &format!(
+                            "confirm_media_bulk_upload: Failed to insert media file {}: {err}",
+                            file.hash
+                        ),
+                        sentry::Level::Error,
+                    );
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Internal error".to_string(),
+                    )
+                })?
+                .get::<_, i64>(0),
+        };
+
+        match tx
+            .execute(
+                "INSERT INTO notetype_media_references (media_id, notetype_id, file_name)
+                 VALUES ($1, $2, $3)
+                 ON CONFLICT (notetype_id, file_name) DO UPDATE SET media_id = EXCLUDED.media_id",
+                &[&media_id, &notetype_id, &file.filename],
+            )
+            .await
+        {
+            Ok(_) => {
+                processed_files.push(MediaProcessedFile {
+                    hash: file.hash.clone(),
+                    media_id,
+                    success: true,
+                    error: None,
+                });
+                actual_bytes_stored += file.file_size as u64;
+            }
+            Err(err) => {
+                sentry::capture_message(
+                    &format!(
+                        "confirm_media_bulk_upload: Failed to create notetype media reference for file {} (media_id {media_id}, notetype_id {notetype_id}): {err}",
+                        file.filename
+                    ),
+                    sentry::Level::Error,
+                );
+                processed_files.push(MediaProcessedFile {
+                    hash: file.hash.clone(),
+                    media_id,
+                    success: false,
+                    error: Some("Error creating reference".to_string()),
+                });
+            }
+        }
+    }
 
     // Process files with known note_ids
     for file in files_with_known_notes {
@@ -2522,12 +2877,17 @@ enum ContentValidationOutcome {
 }
 
 async fn validate_media_stream(
+    filename: &str,
+    is_notetype: bool,
     byte_stream: ByteStream,
     expected_hash: &str,
 ) -> Result<ContentValidationOutcome, Box<dyn std::error::Error + Send + Sync>> {
     let mut reader = byte_stream.into_async_read();
     let mut buffer = [0u8; 8192];
     let mut content = Vec::new();
+
+    let max_allowed_size =
+        max_file_size_for_filename(filename, is_notetype).unwrap_or(MAX_FILE_SIZE_BYTES);
 
     loop {
         let bytes_read = reader.read(&mut buffer).await?;
@@ -2537,7 +2897,7 @@ async fn validate_media_stream(
 
         content.extend_from_slice(&buffer[..bytes_read]);
 
-        if content.len() > MAX_FILE_SIZE_BYTES {
+        if content.len() > max_allowed_size {
             return Ok(ContentValidationOutcome::Invalid {
                 reason: "too_large",
                 mime: None,
@@ -2552,8 +2912,30 @@ async fn validate_media_stream(
         });
     }
 
-    let detected = if let Some(media) = detect_supported_media(&content) {
-        media
+    let ext = std::path::Path::new(filename)
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    let is_svg = if is_notetype && matches!(ext.as_str(), "js" | "css") {
+        if !validate_static_code_content(&content) {
+            return Ok(ContentValidationOutcome::Invalid {
+                reason: "invalid_utf8_or_nul",
+                mime: determine_content_type_by_name(filename),
+            });
+        }
+        false
+    } else if is_notetype && matches!(ext.as_str(), "ttf" | "otf" | "woff" | "woff2") {
+        if !validate_font_content(&ext, &content) {
+            return Ok(ContentValidationOutcome::Invalid {
+                reason: "invalid_font_magic_bytes",
+                mime: determine_content_type_by_name(filename),
+            });
+        }
+        false
+    } else if let Some(media) = detect_supported_media(&content) {
+        media.is_svg
     } else {
         let detected_mime = detect_mime(&content).unwrap_or("unknown").to_string();
 
@@ -2602,7 +2984,7 @@ async fn validate_media_stream(
 
     let mut hasher = Md5::new();
 
-    if detected.is_svg {
+    if is_svg {
         let sanitized = sanitize_svg(&content);
 
         if sanitized.is_empty() {
@@ -2657,9 +3039,9 @@ fn media_s3_key_from_hash(hash: &str) -> Option<String> {
 }
 
 /// Detailed rejection reasons for filename validation
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(dead_code)] // Fields are used in Debug formatting for Sentry logs
-enum FilenameRejectionReason {
+pub(crate) enum FilenameRejectionReason {
     EmptyOrTooShort,
     TooLong,
     PathTraversal,
@@ -2747,6 +3129,119 @@ fn check_filename_validity(filename: &str) -> Result<(), FilenameRejectionReason
 
 fn is_allowed_extension(filename: &str) -> bool {
     check_filename_validity(filename).is_ok()
+}
+
+pub(crate) fn check_notetype_filename_validity(
+    filename: &str,
+) -> Result<(), FilenameRejectionReason> {
+    const NOTETYPE_ALLOWED_EXTENSIONS: [&str; 17] = [
+        "jpg", "jpeg", "png", "gif", "webp", "svg", "bmp", "tif", "tiff", "mp3", "ogg", "js",
+        "css", "ttf", "otf", "woff", "woff2",
+    ];
+
+    if filename.is_empty() || filename.len() < 4 {
+        return Err(FilenameRejectionReason::EmptyOrTooShort);
+    }
+
+    if filename.len() > 255 {
+        return Err(FilenameRejectionReason::TooLong);
+    }
+
+    if filename.contains('/') || filename.contains('\\') || filename.contains("..") {
+        return Err(FilenameRejectionReason::PathTraversal);
+    }
+
+    if filename.ends_with('.') || filename.ends_with(' ') {
+        return Err(FilenameRejectionReason::EndsWithDotOrSpace);
+    }
+
+    if filename.trim().is_empty() {
+        return Err(FilenameRejectionReason::OnlyWhitespace);
+    }
+
+    for c in filename.chars() {
+        if c.is_control() {
+            return Err(FilenameRejectionReason::InvalidCharacter(c));
+        }
+        if !(c.is_alphanumeric()
+            || c == '.'
+            || c == '-'
+            || c == '_'
+            || c == ' '
+            || c == '('
+            || c == ')'
+            || c == '+'
+            || c == ','
+            || c == '%'
+            || c == '&')
+        {
+            return Err(FilenameRejectionReason::InvalidCharacter(c));
+        }
+    }
+
+    if !filename.starts_with('_') {
+        return Err(FilenameRejectionReason::InvalidStartChar);
+    }
+
+    if !filename.chars().any(char::is_alphanumeric) {
+        return Err(FilenameRejectionReason::NoAlphanumeric);
+    }
+
+    let path = std::path::Path::new(filename);
+    let ext = match path.extension().and_then(|s| s.to_str()) {
+        Some(ext) => ext.to_lowercase(),
+        None => return Err(FilenameRejectionReason::NoExtension),
+    };
+
+    if !NOTETYPE_ALLOWED_EXTENSIONS.contains(&ext.as_str()) {
+        return Err(FilenameRejectionReason::DisallowedExtension(ext));
+    }
+
+    Ok(())
+}
+
+#[must_use]
+pub fn is_allowed_notetype_filename(filename: &str) -> bool {
+    check_notetype_filename_validity(filename).is_ok()
+}
+
+pub(crate) fn max_file_size_for_filename(filename: &str, is_notetype: bool) -> Option<usize> {
+    const STANDARD_EXTENSIONS: [&str; 11] = [
+        "jpg", "jpeg", "png", "gif", "webp", "svg", "bmp", "tif", "tiff", "mp3", "ogg",
+    ];
+
+    let ext = std::path::Path::new(filename)
+        .extension()
+        .and_then(|s| s.to_str())?
+        .to_lowercase();
+
+    if STANDARD_EXTENSIONS.contains(&ext.as_str()) {
+        return Some(MAX_FILE_SIZE_BYTES);
+    }
+
+    if is_notetype && filename.starts_with('_') {
+        match ext.as_str() {
+            "js" | "css" => Some(MAX_STATIC_CODE_SIZE_BYTES),
+            "ttf" | "otf" | "woff" | "woff2" => Some(MAX_FONT_SIZE_BYTES),
+            _ => None,
+        }
+    } else {
+        None
+    }
+}
+
+pub(crate) fn validate_static_code_content(content: &[u8]) -> bool {
+    std::str::from_utf8(content).is_ok() && !content.contains(&0)
+}
+
+pub(crate) fn validate_font_content(extension: &str, content: &[u8]) -> bool {
+    match extension.to_lowercase().as_str() {
+        "woff" => content.starts_with(b"wOFF"),
+        "woff2" => content.starts_with(b"wOF2"),
+        "ttf" => content.starts_with(&[0x00, 0x01, 0x00, 0x00]) || content.starts_with(b"true"),
+        "otf" => content.starts_with(b"OTTO"),
+        _ => false,
+    }
 }
 
 /// Like `is_allowed_extension`, but logs the rejection reason to Sentry for diagnostics
@@ -2853,10 +3348,22 @@ pub async fn get_media_manifest(
             JOIN media_files mf ON mf.id = mr.media_id
             WHERE ni.subscriber_note_id IN (SELECT id FROM deck_notes)
             AND mr.file_name = ANY($2)
+        ),
+        -- Notetype media references for notetypes used in deck tree
+        notetype_refs AS (
+            SELECT DISTINCT mf.hash, nmr.file_name, mf.file_size
+            FROM notetype_media_references nmr
+            JOIN media_files mf ON mf.id = nmr.media_id
+            WHERE nmr.notetype_id IN (
+                SELECT DISTINCT notetype FROM notes WHERE deck IN (SELECT id FROM deck_tree) AND NOT deleted
+            )
+            AND nmr.file_name = ANY($2)
         )
         SELECT * FROM direct_refs
         UNION
         SELECT * FROM inherited_refs
+        UNION
+        SELECT * FROM notetype_refs
     ";
 
     let media_rows = db_client
@@ -3007,4 +3514,162 @@ pub async fn sanitize_svg_batch(
     }
 
     Ok(Json(SvgSanitizeResponse { sanitized_files }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_check_notetype_filename_validity() {
+        // Valid notetype filenames
+        assert!(check_notetype_filename_validity("_style.css").is_ok());
+        assert!(check_notetype_filename_validity("_app.js").is_ok());
+        assert!(check_notetype_filename_validity("_font.woff").is_ok());
+        assert!(check_notetype_filename_validity("_font.woff2").is_ok());
+        assert!(check_notetype_filename_validity("_font.ttf").is_ok());
+        assert!(check_notetype_filename_validity("_font.otf").is_ok());
+        assert!(check_notetype_filename_validity("_image.png").is_ok());
+        assert!(check_notetype_filename_validity("_audio.mp3").is_ok());
+
+        // Invalid: missing leading underscore
+        assert_eq!(
+            check_notetype_filename_validity("style.css"),
+            Err(FilenameRejectionReason::InvalidStartChar)
+        );
+        assert_eq!(
+            check_notetype_filename_validity("app.js"),
+            Err(FilenameRejectionReason::InvalidStartChar)
+        );
+
+        // Invalid: no extension
+        assert_eq!(
+            check_notetype_filename_validity("_blank"),
+            Err(FilenameRejectionReason::NoExtension)
+        );
+
+        // Invalid: disallowed extension
+        assert_eq!(
+            check_notetype_filename_validity("_script.py"),
+            Err(FilenameRejectionReason::DisallowedExtension(
+                "py".to_string()
+            ))
+        );
+        assert_eq!(
+            check_notetype_filename_validity("_app.exe"),
+            Err(FilenameRejectionReason::DisallowedExtension(
+                "exe".to_string()
+            ))
+        );
+
+        // Invalid: path traversal
+        assert_eq!(
+            check_notetype_filename_validity("_../test.js"),
+            Err(FilenameRejectionReason::PathTraversal)
+        );
+
+        // Invalid: ends with dot or space
+        assert_eq!(
+            check_notetype_filename_validity("_test.js."),
+            Err(FilenameRejectionReason::EndsWithDotOrSpace)
+        );
+    }
+
+    #[test]
+    fn test_max_file_size_for_filename() {
+        // Notetype files
+        assert_eq!(
+            max_file_size_for_filename("_script.js", true),
+            Some(1024 * 1024)
+        );
+        assert_eq!(
+            max_file_size_for_filename("_style.css", true),
+            Some(1024 * 1024)
+        );
+        assert_eq!(
+            max_file_size_for_filename("_font.woff", true),
+            Some(3 * 1024 * 1024)
+        );
+        assert_eq!(
+            max_file_size_for_filename("_font.woff2", true),
+            Some(3 * 1024 * 1024)
+        );
+        assert_eq!(
+            max_file_size_for_filename("_font.ttf", true),
+            Some(3 * 1024 * 1024)
+        );
+        assert_eq!(
+            max_file_size_for_filename("_font.otf", true),
+            Some(3 * 1024 * 1024)
+        );
+
+        // Standard image/audio for notetype
+        assert_eq!(
+            max_file_size_for_filename("_image.png", true),
+            Some(10 * 1024 * 1024)
+        );
+
+        // Standard files for notes (is_notetype = false)
+        assert_eq!(
+            max_file_size_for_filename("image.png", false),
+            Some(10 * 1024 * 1024)
+        );
+        assert_eq!(
+            max_file_size_for_filename("audio.mp3", false),
+            Some(10 * 1024 * 1024)
+        );
+
+        // JS/CSS/Fonts are disallowed for note media
+        assert_eq!(max_file_size_for_filename("script.js", false), None);
+        assert_eq!(max_file_size_for_filename("_script.js", false), None);
+        assert_eq!(max_file_size_for_filename("_font.woff2", false), None);
+
+        // Notetype files without leading underscore
+        assert_eq!(max_file_size_for_filename("script.js", true), None);
+        assert_eq!(max_file_size_for_filename("font.woff2", true), None);
+    }
+
+    #[test]
+    fn test_validate_static_code_content() {
+        // Valid UTF-8
+        let valid_js = b"console.log('hello world');\nlet x = 42;";
+        assert!(validate_static_code_content(valid_js));
+
+        let valid_css = b"body { color: red; font-size: 16px; }";
+        assert!(validate_static_code_content(valid_css));
+
+        // Invalid UTF-8
+        let invalid_utf8 = [0xFF, 0xFE, 0xFD];
+        assert!(!validate_static_code_content(&invalid_utf8));
+
+        // UTF-8 containing NUL byte
+        let contains_nul = b"console.log('hello\0world');";
+        assert!(!validate_static_code_content(contains_nul));
+    }
+
+    #[test]
+    fn test_validate_font_content() {
+        // WOFF
+        assert!(validate_font_content("woff", b"wOFF\x00\x01..."));
+        assert!(!validate_font_content("woff", b"bad_magic..."));
+
+        // WOFF2
+        assert!(validate_font_content("woff2", b"wOF2\x00\x01..."));
+        assert!(!validate_font_content("woff2", b"wOFF\x00\x01..."));
+
+        // TTF
+        assert!(validate_font_content(
+            "ttf",
+            &[0x00, 0x01, 0x00, 0x00, 0x00, 0x04]
+        ));
+        assert!(validate_font_content("ttf", b"true\x00\x01..."));
+        assert!(!validate_font_content("ttf", b"OTTO..."));
+
+        // OTF
+        assert!(validate_font_content("otf", b"OTTO\x00\x01..."));
+        assert!(!validate_font_content("otf", b"TTF_..."));
+
+        // Unknown
+        assert!(!validate_font_content("exe", b"wOFF..."));
+    }
 }
