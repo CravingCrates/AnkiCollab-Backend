@@ -2689,6 +2689,121 @@ GRANT ALL ON SCHEMA public TO PUBLIC;
 
 
 --
+-- Community Moderation and Democracy System Tables
+--
+
+CREATE TABLE IF NOT EXISTS anki.deck_democracy_settings (
+    deck_id bigint NOT NULL,
+    enabled boolean DEFAULT false NOT NULL,
+    mode character varying(32) DEFAULT 'consensus_strict'::character varying NOT NULL,
+    approval_threshold integer DEFAULT 5 NOT NULL,
+    require_unanimity boolean DEFAULT true NOT NULL,
+    weekly_vote_limit integer DEFAULT 20 NOT NULL,
+    min_days_subscribed integer DEFAULT 14 NOT NULL,
+    min_cards_reviewed integer DEFAULT 200 NOT NULL,
+    notifications_enabled boolean DEFAULT true NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT deck_democracy_settings_pkey PRIMARY KEY (deck_id),
+    CONSTRAINT deck_democracy_settings_deck_id_fkey FOREIGN KEY (deck_id) REFERENCES anki.decks(id) ON DELETE CASCADE
+);
+
+ALTER TABLE anki.deck_democracy_settings OWNER TO postgres;
+
+CREATE TABLE IF NOT EXISTS anki.deck_moderator_roster (
+    id bigint NOT NULL,
+    deck_id bigint NOT NULL,
+    user_id integer NOT NULL,
+    status character varying(16) NOT NULL,
+    allowed_tags text[],
+    reason text,
+    reviews_count integer DEFAULT 0 NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT deck_moderator_roster_pkey PRIMARY KEY (id),
+    CONSTRAINT deck_moderator_roster_deck_user_unique UNIQUE (deck_id, user_id),
+    CONSTRAINT deck_moderator_roster_deck_id_fkey FOREIGN KEY (deck_id) REFERENCES anki.decks(id) ON DELETE CASCADE,
+    CONSTRAINT deck_moderator_roster_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE
+);
+
+ALTER TABLE anki.deck_moderator_roster OWNER TO postgres;
+
+CREATE SEQUENCE IF NOT EXISTS anki.deck_moderator_roster_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+ALTER SEQUENCE anki.deck_moderator_roster_id_seq OWNER TO postgres;
+ALTER TABLE ONLY anki.deck_moderator_roster ALTER COLUMN id SET DEFAULT nextval('anki.deck_moderator_roster_id_seq'::regclass);
+
+CREATE INDEX IF NOT EXISTS idx_deck_moderator_roster_deck_user ON anki.deck_moderator_roster USING btree (deck_id, user_id);
+
+CREATE TABLE IF NOT EXISTS anki.deck_moderator_votes (
+    id bigint NOT NULL,
+    deck_id bigint NOT NULL,
+    suggestion_type character varying(16) NOT NULL,
+    suggestion_id bigint NOT NULL,
+    user_id integer NOT NULL,
+    vote character varying(16) NOT NULL,
+    weight numeric(4,2) DEFAULT 1.0 NOT NULL,
+    early_adopted boolean DEFAULT false NOT NULL,
+    voted_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT deck_moderator_votes_pkey PRIMARY KEY (id),
+    CONSTRAINT deck_moderator_votes_unique UNIQUE (suggestion_type, suggestion_id, user_id),
+    CONSTRAINT deck_moderator_votes_deck_id_fkey FOREIGN KEY (deck_id) REFERENCES anki.decks(id) ON DELETE CASCADE,
+    CONSTRAINT deck_moderator_votes_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE
+);
+
+ALTER TABLE anki.deck_moderator_votes OWNER TO postgres;
+
+CREATE SEQUENCE IF NOT EXISTS anki.deck_moderator_votes_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+ALTER SEQUENCE anki.deck_moderator_votes_id_seq OWNER TO postgres;
+ALTER TABLE ONLY anki.deck_moderator_votes ALTER COLUMN id SET DEFAULT nextval('anki.deck_moderator_votes_id_seq'::regclass);
+
+CREATE INDEX IF NOT EXISTS idx_deck_moderator_votes_weekly ON anki.deck_moderator_votes USING btree (user_id, voted_at);
+CREATE INDEX IF NOT EXISTS idx_deck_moderator_votes_suggestion ON anki.deck_moderator_votes USING btree (suggestion_type, suggestion_id);
+
+CREATE TABLE IF NOT EXISTS anki.suggestion_moderation_status (
+    suggestion_type character varying(16) NOT NULL,
+    suggestion_id bigint NOT NULL,
+    deck_id bigint NOT NULL,
+    status character varying(32) DEFAULT 'voting'::character varying NOT NULL,
+    approve_count integer DEFAULT 0 NOT NULL,
+    reject_count integer DEFAULT 0 NOT NULL,
+    total_weight numeric(6,2) DEFAULT 0.0 NOT NULL,
+    resolved_at timestamp with time zone,
+    note_id bigint,
+    field_position integer,
+    field_name character varying(255),
+    original_content text,
+    new_content text,
+    tag_name character varying(255),
+    tag_action boolean,
+    reverted_at timestamp with time zone,
+    reverted_by integer,
+    override_reason text,
+    CONSTRAINT suggestion_moderation_status_pkey PRIMARY KEY (suggestion_type, suggestion_id),
+    CONSTRAINT suggestion_moderation_status_deck_id_fkey FOREIGN KEY (deck_id) REFERENCES anki.decks(id) ON DELETE CASCADE,
+    CONSTRAINT suggestion_moderation_status_reverted_by_fkey FOREIGN KEY (reverted_by) REFERENCES public.users(id) ON DELETE SET NULL
+);
+
+ALTER TABLE anki.suggestion_moderation_status OWNER TO postgres;
+
+CREATE INDEX IF NOT EXISTS idx_suggestion_moderation_deck_status ON anki.suggestion_moderation_status USING btree (deck_id, status);
+CREATE INDEX IF NOT EXISTS idx_suggestion_moderation_deck_resolved ON anki.suggestion_moderation_status USING btree (deck_id, resolved_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_deck_moderator_votes_deck_voted ON anki.deck_moderator_votes USING btree (deck_id, voted_at DESC);
+
+
+--
 -- PostgreSQL database dump complete
 --
 

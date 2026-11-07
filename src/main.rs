@@ -32,6 +32,7 @@ pub mod media_manager;
 pub mod media_proxy;
 pub mod media_reference_manager;
 pub mod media_tokens;
+pub mod moderation;
 pub mod note_removal;
 pub mod notetypes;
 pub mod notifications;
@@ -128,7 +129,7 @@ async fn create_note_links(
     }
 }
 
-fn validate_deck_hash(deck_hash: &str) -> bool {
+pub(crate) fn validate_deck_hash(deck_hash: &str) -> bool {
     let parts: Vec<&str> = deck_hash.split('-').collect();
 
     // Validate deck hash format: 3, 5, or 6 words (legacy and standard formats)
@@ -2343,7 +2344,7 @@ async fn main() {
             get(get_protected_fields_from_deck),
         )
         .route("/ResolveNoteReview", post(resolve_note_for_review))
-        .layer(GovernorLayer::new(standard_governor_conf));
+        .layer(GovernorLayer::new(standard_governor_conf.clone()));
 
     let auth_routes = Router::new()
         .route("/login", post(post_login))
@@ -2369,6 +2370,38 @@ async fn main() {
         .route("/pair/init", post(pairing::post_pair_init))
         .layer(GovernorLayer::new(pair_init_governor_conf));
 
+    let moderation_routes = Router::new()
+        .route(
+            "/v2/moderation/status/{deck_hash}",
+            get(moderation::get_status),
+        )
+        .route(
+            "/v2/moderation/queue/{deck_hash}",
+            get(moderation::get_queue),
+        )
+        .route("/v2/moderation/vote", post(moderation::vote))
+        .route(
+            "/v2/moderation/sync_eligibility",
+            post(moderation::sync_eligibility),
+        )
+        .route(
+            "/v2/moderation/self_specialization",
+            post(moderation::self_specialization),
+        )
+        .route(
+            "/v2/moderation/audit/{deck_hash}",
+            get(moderation::get_audit_log),
+        )
+        .route(
+            "/v2/moderation/override",
+            post(moderation::post_moderation_override),
+        )
+        .route(
+            "/v2/moderation/roster/action",
+            post(moderation::post_roster_action),
+        )
+        .layer(GovernorLayer::new(standard_governor_conf));
+
     let media_routes = Router::new().nest("/media", media_routes());
 
     let app = Router::new()
@@ -2376,6 +2409,7 @@ async fn main() {
         .merge(auth_routes)
         .merge(pair_poll_routes)
         .merge(pair_init_routes)
+        .merge(moderation_routes)
         .merge(media_routes)
         // standard rate limiting - applied to all routes EXCEPT media proxy
         .merge(media_proxy::routes().layer(axum::extract::DefaultBodyLimit::max(20 * 1024 * 1024)))
