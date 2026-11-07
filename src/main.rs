@@ -23,6 +23,7 @@ pub mod changelog;
 pub mod cleanser;
 pub mod contribution_stats;
 pub mod database;
+pub mod deck_proposal_rules;
 pub mod error;
 pub mod human_hash;
 pub mod inheritance;
@@ -252,6 +253,76 @@ fn decompress_data(engine: &general_purpose::GeneralPurpose, data: &str) -> Resu
     Ok(decoded_data)
 }
 
+fn count_deck_notes(deck: &structs::AnkiDeck) -> usize {
+    let mut count = deck.notes.len();
+    for child in &deck.children {
+        count += count_deck_notes(child);
+    }
+    count
+}
+
+fn collect_deck_notes_recursive<'a>(deck: &'a structs::AnkiDeck) -> Vec<&'a structs::Note> {
+    let mut notes = Vec::new();
+    notes.extend(&deck.notes);
+    for child in &deck.children {
+        notes.extend(collect_deck_notes_recursive(child));
+    }
+    notes
+}
+
+fn sanitize_deck_notes(
+    deck: &mut structs::AnkiDeck,
+    rules: &deck_proposal_rules::DeckProposalRules,
+) {
+    let compiled_html = rules.compile_custom_html();
+    sanitize_deck_notes_recursive(deck, rules, compiled_html.as_ref());
+}
+
+fn sanitize_deck_notes_recursive(
+    deck: &mut structs::AnkiDeck,
+    rules: &deck_proposal_rules::DeckProposalRules,
+    compiled_html: Option<&deck_proposal_rules::CompiledCustomHtmlRules>,
+) {
+    for note in &mut deck.notes {
+        for (i, field) in note.fields.iter_mut().enumerate() {
+            let is_back = i > 0;
+            *field = deck_proposal_rules::sanitize_proposal_content_with_compiled(
+                field,
+                is_back,
+                rules,
+                compiled_html,
+            );
+        }
+        if !rules.forbidden_tags.trim().is_empty() {
+            note.tags
+                .retain(|t| !deck_proposal_rules::is_tag_forbidden(t, &rules.forbidden_tags));
+        }
+        if !rules.custom_tag_rules.trim().is_empty() {
+            note.tags = deck_proposal_rules::apply_custom_tag_rules(
+                note.tags.clone(),
+                &rules.custom_tag_rules,
+            );
+        }
+        if rules.normalize_tag_casing == "lower" || rules.normalize_tag_casing == "lowercase" {
+            for t in &mut note.tags {
+                *t = t.to_lowercase();
+            }
+        } else if rules.normalize_tag_casing == "upper" || rules.normalize_tag_casing == "uppercase"
+        {
+            for t in &mut note.tags {
+                *t = t.to_uppercase();
+            }
+        } else if rules.normalize_tag_casing == "slugify" {
+            for t in &mut note.tags {
+                *t = t.to_lowercase().replace(' ', "_");
+            }
+        }
+    }
+    for child in &mut deck.children {
+        sanitize_deck_notes_recursive(child, rules, compiled_html);
+    }
+}
+
 // Handler to submit card suggestions; runs background work on the Tokio runtime.
 pub async fn process_card(
     auth_user: Option<AuthenticatedUser>,
@@ -406,6 +477,99 @@ pub async fn process_card(
                 return send((StatusCode::UNPROCESSABLE_ENTITY, r"Deck not found. If this is a new subdeck, try to suggest the entire deck tree from the sideview.".to_owned()));
             }
         };
+
+        if !force_overwrite {
+            if let Some(target_deck_id) = deck_id {
+                let rules = deck_proposal_rules::get_rules(&mut client, target_deck_id)
+                    .await
+                    .unwrap_or_default();
+
+                // 1. Rationale policy
+                if rules.require_rationale && info.commit_text.trim().is_empty() {
+                    send((
+                        StatusCode::BAD_REQUEST,
+                        "Proposal rejected by deck policy: A rationale or explanation is required for suggestions on this deck. Please explain your changes.".to_string(),
+                    ));
+                    return;
+                }
+
+                // 2. Max cards per proposal
+                let total_notes = count_deck_notes(&anki_deck);
+                if rules.max_cards_per_proposal > 0
+                    && total_notes > rules.max_cards_per_proposal as usize
+                {
+                    send((
+                        StatusCode::BAD_REQUEST,
+                        format!(
+                            "Proposal rejected by deck policy: This deck restricts submissions to {} cards maximum per proposal (you submitted {} cards). Please submit in smaller batches.",
+                            rules.max_cards_per_proposal,
+                            total_notes
+                        ),
+                    ));
+                    return;
+                }
+
+                // 3. Protected tag namespaces (contributors cannot add or remove protected tags)
+                if !rules.protected_tag_namespaces.trim().is_empty() {
+                    let all_notes = collect_deck_notes_recursive(&anki_deck);
+                    for note in all_notes {
+                        // Check additions: all tags in note.tags that are protected must already exist in DB
+                        for tag in &note.tags {
+                            if deck_proposal_rules::is_tag_protected(tag, &rules.protected_tag_namespaces) {
+                                let tag_exists = client
+                                    .query_opt(
+                                        "SELECT 1 FROM anki.tags t \
+                                         INNER JOIN anki.notes n ON t.note = n.id \
+                                         WHERE n.guid = $1 AND t.content = $2 AND t.reviewed = true",
+                                        &[&note.guid, &tag],
+                                    )
+                                    .await;
+                                if !matches!(tag_exists, Ok(Some(_))) {
+                                    send((
+                                        StatusCode::BAD_REQUEST,
+                                        format!(
+                                            "Proposal rejected by deck policy: Tag '{}' belongs to a protected namespace ({}) and cannot be added by contributors.",
+                                            tag, rules.protected_tag_namespaces
+                                        ),
+                                    ));
+                                    return;
+                                }
+                            }
+                        }
+
+                        // Check deletions: all existing protected tags in DB on this note must be retained
+                        let existing_tags = client
+                            .query(
+                                "SELECT t.content FROM anki.tags t \
+                                 INNER JOIN anki.notes n ON t.note = n.id \
+                                 WHERE n.guid = $1 AND t.reviewed = true",
+                                &[&note.guid],
+                            )
+                            .await;
+                        if let Ok(rows) = existing_tags {
+                            for r in rows {
+                                let exist_tag: String = r.get(0);
+                                if deck_proposal_rules::is_tag_protected(&exist_tag, &rules.protected_tag_namespaces) {
+                                    if !note.tags.iter().any(|t| t == &exist_tag) {
+                                        send((
+                                            StatusCode::BAD_REQUEST,
+                                            format!(
+                                                "Proposal rejected by deck policy: Tag '{}' belongs to a protected namespace ({}) and cannot be removed by contributors.",
+                                                exist_tag, rules.protected_tag_namespaces
+                                            ),
+                                        ));
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 4. Sanitize HTML & tags across deck and subdecks
+                sanitize_deck_notes(&mut anki_deck, &rules);
+            }
+        }
 
         let deck_tree: Vec<i64> = match client
             .query(
@@ -1030,6 +1194,49 @@ pub async fn request_removal(
     let mut force_overwrite = false;
     if is_owner_or_maintainer {
         force_overwrite = info.force_overwrite;
+    }
+
+    if !force_overwrite {
+        if let Ok(mut client) = db_state.db_pool.get_owned().await {
+            let deck_row = client
+                .query_opt(
+                    "SELECT id FROM decks WHERE human_hash = $1",
+                    &[&info.remote_deck],
+                )
+                .await
+                .unwrap_or(None);
+            if let Some(row) = deck_row {
+                let deck_id: i64 = row.get(0);
+                let rules = deck_proposal_rules::get_rules(&mut client, deck_id)
+                    .await
+                    .unwrap_or_default();
+
+                if rules.disallow_deletion_suggestions {
+                    return (
+                        StatusCode::FORBIDDEN,
+                        "Card deletion proposals are disabled for this deck by the administrator. Only deck maintainers may delete cards.".to_string(),
+                    );
+                }
+                if rules.require_rationale && info.commit_text.trim().is_empty() {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        "Proposal rejected by deck policy: A rationale or explanation is required when requesting card deletions on this deck.".to_string(),
+                    );
+                }
+                if rules.max_cards_per_proposal > 0
+                    && info.note_guids.len() > rules.max_cards_per_proposal as usize
+                {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        format!(
+                            "Proposal rejected by deck policy: Card deletion requests are restricted to {} cards maximum (you selected {} cards).",
+                            rules.max_cards_per_proposal,
+                            info.note_guids.len()
+                        ),
+                    );
+                }
+            }
+        }
     }
 
     let committing_user: Option<i32> = authed_user_id;

@@ -1091,6 +1091,45 @@ pub async fn check_media_bulk(
         )
     })?;
 
+    // Check deck proposal rules for max media file size limit
+    let max_mb_limit = {
+        let deck_row = tx
+            .query_opt(
+                "SELECT id FROM decks WHERE human_hash = $1",
+                &[&req.deck_hash],
+            )
+            .await
+            .unwrap_or(None);
+        if let Some(row) = deck_row {
+            let deck_id: i64 = row.get(0);
+            let rules_row = tx
+                .query_opt(
+                    "SELECT max_media_file_size_mb FROM anki.deck_proposal_rules WHERE deck = $1",
+                    &[&deck_id],
+                )
+                .await
+                .unwrap_or(None);
+            rules_row.map(|r| r.get::<_, i32>(0)).unwrap_or(0)
+        } else {
+            0
+        }
+    };
+
+    if max_mb_limit > 0 {
+        let max_bytes = i64::from(max_mb_limit) * 1024 * 1024;
+        for file in &valid_files {
+            if (file.file_size as i64) > max_bytes {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "File {} exceeds deck max media size limit ({} MB)",
+                        file.filename, max_mb_limit
+                    ),
+                ));
+            }
+        }
+    }
+
     // Get all note IDs that are in the deck or its descendants,
     // OR are part of ongoing bulk operations
     let note_guids: Vec<&str> = valid_files

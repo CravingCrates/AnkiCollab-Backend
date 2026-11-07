@@ -1,0 +1,38 @@
+-- Migration: 20261104_deck_proposal_rules.sql
+-- Description: Table for Deck Proposal Rules (tagging, HTML strip, cloze repair, rationale, etc.)
+
+CREATE TABLE IF NOT EXISTS anki.deck_proposal_rules (
+    deck bigint NOT NULL,
+    strip_colors boolean DEFAULT false NOT NULL,
+    strip_span boolean DEFAULT false NOT NULL,
+    strip_inline_styles boolean DEFAULT false NOT NULL,
+    strip_font_tags boolean DEFAULT false NOT NULL,
+    prevent_center_on_back boolean DEFAULT false NOT NULL,
+    trim_trailing_breaks boolean DEFAULT false NOT NULL,
+    normalize_spaces boolean DEFAULT false NOT NULL,
+    auto_repair_cloze boolean DEFAULT false NOT NULL,
+    strip_empty_elements boolean DEFAULT false NOT NULL,
+    auto_tag_new_cards boolean DEFAULT false NOT NULL,
+    new_card_tag_pattern character varying(100) DEFAULT ''::character varying NOT NULL,
+    auto_tag_updated_cards boolean DEFAULT false NOT NULL,
+    updated_card_tag_pattern character varying(100) DEFAULT ''::character varying NOT NULL,
+    prune_old_update_tags boolean DEFAULT false NOT NULL,
+    old_update_tag_pattern character varying(100) DEFAULT ''::character varying NOT NULL,
+    forbidden_tags text DEFAULT ''::text NOT NULL,
+    normalize_tag_casing character varying(20) DEFAULT 'none'::character varying NOT NULL,
+    protected_tag_namespaces text DEFAULT ''::text NOT NULL,
+    enable_media_compression boolean DEFAULT false NOT NULL,
+    max_image_dimension integer DEFAULT 0 NOT NULL,
+    image_quality integer DEFAULT 0 NOT NULL,
+    auto_convert_heavy_images boolean DEFAULT false NOT NULL,
+    strip_exif_metadata boolean DEFAULT false NOT NULL,
+    max_media_file_size_mb integer DEFAULT 0 NOT NULL,
+    require_rationale boolean DEFAULT false NOT NULL,
+    disallow_deletion_suggestions boolean DEFAULT false NOT NULL,
+    max_cards_per_proposal integer DEFAULT 0 NOT NULL,
+    custom_html_rules text DEFAULT ''::text NOT NULL,
+    custom_tag_rules text DEFAULT ''::text NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT deck_proposal_rules_pkey PRIMARY KEY (deck),
+    CONSTRAINT deck_proposal_rules_deck_fkey FOREIGN KEY (deck) REFERENCES anki.decks(id) ON DELETE CASCADE
+);
