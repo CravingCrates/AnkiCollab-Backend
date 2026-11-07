@@ -483,3 +483,42 @@ pub struct MyImpactStats {
     pub latest_accepted: Option<ImpactLatestAccepted>,
     pub decks: Vec<ImpactDeck>,
 }
+
+#[derive(Debug, Deserialize)]
+pub struct NoteHistoryRequest {
+    pub deck_hash: String,
+    pub guid: String,
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct NoteHistoryResponse {
+    pub note_id: i64,
+    pub guid: String,
+    pub deck_name: String,
+    pub groups: Vec<NoteHistoryGroupResponse>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct NoteHistoryGroupResponse {
+    pub commit_id: Option<i32>,
+    pub commit_author: Option<String>,
+    pub commit_rationale: Option<String>,
+    pub commit_timestamp: Option<String>,
+    pub approved: bool,
+    pub denied: bool,
+    pub events: Vec<NoteHistoryEventResponse>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct NoteHistoryEventResponse {
+    pub id: i64,
+    pub version: i64,
+    pub event_type: String,
+    pub actor_username: Option<String>,
+    pub field_name: Option<String>,
+    pub old_human: Option<String>,
+    pub new_human: Option<String>,
+    pub diff_html: Option<String>,
+    pub created_at: String,
+}

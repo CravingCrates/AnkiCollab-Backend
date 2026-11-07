@@ -31,6 +31,7 @@ pub mod media_manager;
 pub mod media_proxy;
 pub mod media_reference_manager;
 pub mod media_tokens;
+pub mod note_history_api;
 pub mod note_removal;
 pub mod notetypes;
 pub mod notifications;
@@ -2136,7 +2137,8 @@ async fn main() {
             get(get_protected_fields_from_deck),
         )
         .route("/ResolveNoteReview", post(resolve_note_for_review))
-        .layer(GovernorLayer::new(standard_governor_conf));
+        .route("/GetNoteHistory", post(note_history_api::get_note_history))
+        .layer(GovernorLayer::new(standard_governor_conf.clone()));
 
     let auth_routes = Router::new()
         .route("/login", post(post_login))
