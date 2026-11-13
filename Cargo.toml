@@ -16,7 +16,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 aws-config = { version = "1.13.0", features = ["behavior-version-latest"] }
 aws-sdk-s3 = { version = "1.156.0", features = ["behavior-version-latest"] }
 tokio = { version = "1.54.1", features = ["full"] }
-tokio-util = { version = "0.7.20", features = ["io"] }
+tokio-util = { version = "0.7.20", features = ["io", "rt"] }
 tokio-postgres = { version = "0.7.18", features = ["with-chrono-0_4", "array-impls", "with-serde_json-1", "with-uuid-1"] }
 serde_json = "1.0.154"
 chrono = { version = "0.4.45", features = ["serde"] }
@@ -52,4 +52,3 @@ features = [
     "fast-rng",          # Use a faster (but still sufficiently random) RNG
     "macro-diagnostics", # Enable better diagnostics for compile-time UUIDs
 ]
-

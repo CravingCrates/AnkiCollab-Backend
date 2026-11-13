@@ -907,7 +907,8 @@ pub fn start_cleanup_task(state: Arc<AppState>) {
 
     let orphan_clone = state.clone();
     tokio::spawn(async move {
-        let mut interval = time::interval(cleanup_interval);
+        let mut interval =
+            time::interval_at(time::Instant::now() + cleanup_interval, cleanup_interval);
 
         loop {
             interval.tick().await;
@@ -926,7 +927,10 @@ pub fn start_cleanup_task(state: Arc<AppState>) {
     // Add bulk upload cleanup
     let bulk_state = state;
     tokio::spawn(async move {
-        let mut interval = time::interval(tokio::time::Duration::from_hours(24)); // 24 hour
+        let mut interval = time::interval_at(
+            crate::next_utc_time_instant(3, 30),
+            tokio::time::Duration::from_hours(24),
+        );
 
         loop {
             interval.tick().await;

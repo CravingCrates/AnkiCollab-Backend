@@ -41,6 +41,7 @@ pub struct AppState {
     pub cache_token_replay_cache: Arc<Mutex<HashMap<String, (i64, u8)>>>,
     pub s3_throttle: Arc<S3Throttle>,
     pub min_consent_version: i32,
+    pub tasks: tokio_util::task::TaskTracker,
 }
 
 pub type SharedConn =
@@ -58,7 +59,7 @@ pub async fn establish_pool_connection() -> Result<
 
     let pool = Pool::builder()
         .min_idle(Some(1))
-        .max_size(15)
+        .max_size(14)
         .build(conn_manager)
         .await?;
     Ok(pool)

@@ -270,6 +270,7 @@ pub async fn unpack_notes(
             }
 
             // Stream process tags without intermediate storage
+            let mut seen_tags = HashSet::new();
             for tag_content in &note.tags {
                 let cleaned_tag = cleanser::clean(tag_content);
                 if cleaned_tag.starts_with("AnkiCollab_Optional::")
@@ -277,7 +278,7 @@ pub async fn unpack_notes(
                 {
                     continue; // Invalid Optional tag!
                 }
-                if !cleaned_tag.is_empty() {
+                if !cleaned_tag.is_empty() && seen_tags.insert(cleaned_tag.clone()) {
                     tag_data.push((note_id, cleaned_tag));
                 }
             }
@@ -640,7 +641,7 @@ pub async fn create_root_deck(
     commit: i32,
 ) -> Result<(i64, String), Box<dyn std::error::Error + Send + Sync>> {
     let cleaned_deck_name = cleanser::clean(&deck.name).clone();
-    let cleaned_deck_desc = cleanser::clean(&deck.desc).clone();
+    let cleaned_deck_desc = cleanser::clean_with_styles(&deck.desc).clone();
 
     if cleaned_deck_name.is_empty() {
         return Err("Deck name is empty. Please provide a valid name.".into());
@@ -774,7 +775,7 @@ pub async fn unpack_deck_json(
         return Err("Deck name is empty. Please provide a valid name.".into());
     }
 
-    let cleaned_deck_desc = cleanser::clean(&deck.desc).clone();
+    let cleaned_deck_desc = cleanser::clean_with_styles(&deck.desc).clone();
     // Attempt insert; on unique violation (crowdanki_uuid/human_hash), retry once with a new UUID/human_hash.
     let mut use_uuid = deck.crowdanki_uuid.clone();
     let mut use_hum = hum.clone();

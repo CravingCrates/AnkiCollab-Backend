@@ -30,13 +30,13 @@ pub async fn get_notetype_fields(client: &SharedConn, notetype_id: i64) -> Vec<N
     let mut fields = Vec::with_capacity(rows.len());
 
     for row in rows {
-        let description: String = row.get(0);
-        let font: String = row.get(1);
-        let name: String = row.get(2);
-        let ord: i32 = row.get(3);
-        let rtl: bool = row.get(4);
-        let size: i32 = row.get(5);
-        let sticky: bool = row.get(6);
+        let description: String = row.get::<_, Option<String>>(0).unwrap_or_default();
+        let font: String = row.get::<_, Option<String>>(1).unwrap_or_default();
+        let name: String = row.get::<_, Option<String>>(2).unwrap_or_default();
+        let ord: i32 = row.get::<_, Option<i32>>(3).unwrap_or_default();
+        let rtl: bool = row.get::<_, Option<bool>>(4).unwrap_or_default();
+        let size: i32 = row.get::<_, Option<i32>>(5).unwrap_or_default();
+        let sticky: bool = row.get::<_, Option<bool>>(6).unwrap_or_default();
         let id: Option<i64> = row.get(7);
         let tag: Option<i32> = row.get(8);
 
@@ -69,15 +69,15 @@ pub async fn get_notetype_templates(
     let mut templates = Vec::with_capacity(rows.len());
 
     for row in rows {
-        let qfmt: String = row.get(0);
-        let afmt: String = row.get(1);
-        let bqfmt: String = row.get(2);
-        let bafmt: String = row.get(3);
-        let bfont: String = row.get(4);
-        let bsize: i32 = row.get(5);
-        let name: String = row.get(6);
+        let qfmt: String = row.get::<_, Option<String>>(0).unwrap_or_default();
+        let afmt: String = row.get::<_, Option<String>>(1).unwrap_or_default();
+        let bqfmt: String = row.get::<_, Option<String>>(2).unwrap_or_default();
+        let bafmt: String = row.get::<_, Option<String>>(3).unwrap_or_default();
+        let bfont: String = row.get::<_, Option<String>>(4).unwrap_or_default();
+        let bsize: i32 = row.get::<_, Option<i32>>(5).unwrap_or_default();
+        let name: String = row.get::<_, Option<String>>(6).unwrap_or_default();
         let id: Option<i64> = row.get(7);
-        let ord: i32 = row.get(8);
+        let ord: i32 = row.get::<_, Option<i32>>(8).unwrap_or_default();
 
         templates.push(NotetypeTemplate {
             afmt,
@@ -132,15 +132,15 @@ pub async fn get_notetypes(client: &SharedConn, notes: &Vec<Note>, owner: i32) -
     for row in rows {
         let id: i64 = row.get(0);
         let guid: String = row.get(1);
-        let css: String = row.get(2);
-        let latex_post: String = row.get(3);
-        let latex_pre: String = row.get(4);
-        let latex_svg: bool = row.get(5);
-        let name: String = row.get(6);
-        let type_: i32 = row.get(7);
+        let css: String = row.get::<_, Option<String>>(2).unwrap_or_default();
+        let latex_post: String = row.get::<_, Option<String>>(3).unwrap_or_default();
+        let latex_pre: String = row.get::<_, Option<String>>(4).unwrap_or_default();
+        let latex_svg: bool = row.get::<_, Option<bool>>(5).unwrap_or_default();
+        let name: String = row.get::<_, Option<String>>(6).unwrap_or_default();
+        let type_: i32 = row.get::<_, Option<i32>>(7).unwrap_or_default();
         let original_stock_kind: Option<i32> = row.get(8);
-        let sortf: i32 = row.get(9);
-        let req_str: String = row.get(10);
+        let sortf: i32 = row.get::<_, Option<i32>>(9).unwrap_or_default();
+        let req_str: String = row.get::<_, Option<String>>(10).unwrap_or_default();
 
         let req: Vec<CardRequirement> = from_str(&req_str).unwrap_or_default();
 
@@ -197,10 +197,10 @@ pub async fn pull_protected_fields(
     };
     for row in rows {
         let notetype_id: i64 = row.get(0);
-        let notetype_name: String = row.get(1);
+        let notetype_name: String = row.get::<_, Option<String>>(1).unwrap_or_default();
         let notetype_field_id: i64 = row.get(2);
-        let notetype_field_name: String = row.get(3);
-        let notetype_field_protected: bool = row.get(4);
+        let notetype_field_name: String = row.get::<_, Option<String>>(3).unwrap_or_default();
+        let notetype_field_protected: bool = row.get::<_, Option<bool>>(4).unwrap_or_default();
 
         let current_note_model_id = current_note_model.id;
         if current_note_model_id == 0 || current_note_model_id != notetype_id {
@@ -288,7 +288,11 @@ pub async fn does_notetype_exist(
                     .id
                     .zip(existing.get::<_, Option<i64>>(1))
                     .is_some_and(|(a, b)| a != 0 && b != 0 && a == b);
-                let name_match = field.name == existing.get::<_, String>(0);
+                let name_match = field.name
+                    == existing
+                        .get::<_, Option<String>>(0)
+                        .as_deref()
+                        .unwrap_or("");
                 id_match || name_match
             })
         });
@@ -303,10 +307,26 @@ pub async fn does_notetype_exist(
                     .id
                     .zip(existing.get::<_, Option<i64>>(4))
                     .is_some_and(|(a, b)| a != 0 && b != 0 && a == b);
-                let qfmt_match = template.qfmt == existing.get::<_, String>(0);
-                let afmt_match = template.afmt == existing.get::<_, String>(1);
-                let bqfmt_match = template.bqfmt == existing.get::<_, String>(2);
-                let bafmt_match = template.bafmt == existing.get::<_, String>(3);
+                let qfmt_match = template.qfmt
+                    == existing
+                        .get::<_, Option<String>>(0)
+                        .as_deref()
+                        .unwrap_or("");
+                let afmt_match = template.afmt
+                    == existing
+                        .get::<_, Option<String>>(1)
+                        .as_deref()
+                        .unwrap_or("");
+                let bqfmt_match = template.bqfmt
+                    == existing
+                        .get::<_, Option<String>>(2)
+                        .as_deref()
+                        .unwrap_or("");
+                let bafmt_match = template.bafmt
+                    == existing
+                        .get::<_, Option<String>>(3)
+                        .as_deref()
+                        .unwrap_or("");
                 id_match || (qfmt_match && afmt_match && bqfmt_match && bafmt_match)
             })
         });
@@ -325,7 +345,11 @@ pub async fn does_notetype_exist(
                             .id
                             .zip(existing.get::<_, Option<i64>>(4))
                             .is_some_and(|(a, b)| a != 0 && b != 0 && a == b);
-                        let name_match = template.name == existing.get::<_, String>(5);
+                        let name_match = template.name
+                            == existing
+                                .get::<_, Option<String>>(5)
+                                .as_deref()
+                                .unwrap_or("");
                         id_match || name_match
                     })
                 });

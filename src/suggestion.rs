@@ -290,24 +290,45 @@ async fn force_overwrite_tag(
         .map(|row| row.get::<_, String>("content"))
         .collect::<Vec<String>>();
 
-    // HashSet could be faster in theory, but since our vecs are expected to be very small (< 100 tags on average) this is probably more performant
-    let new_tags: Vec<_> = new_content
+    let new_content: Vec<String> = new_content
         .iter()
-        .filter(|item| !old_tags.contains(item))
-        .collect();
-    let removed_tags: Vec<_> = old_tags
-        .into_iter()
-        .filter(|item| !new_content.contains(item))
+        .map(|item| cleanser::clean(item))
+        .filter(|item| !item.is_empty())
         .collect();
 
-    let insert_new_tag = tx.prepare("
-        INSERT INTO tags (note, content, reviewed, creator_ip, action, commit) VALUES ($1, $2, $3, $4, true, $5)
-    ").await?;
+    let old_tags_set: HashSet<&str> = old_tags.iter().map(String::as_str).collect();
+    let new_tags_set: HashSet<&str> = new_content.iter().map(String::as_str).collect();
+
+    let mut seen_new = HashSet::new();
+    let new_tags: Vec<&str> = new_content
+        .iter()
+        .map(String::as_str)
+        .filter(|&item| !old_tags_set.contains(item) && seen_new.insert(item))
+        .collect();
+    let mut seen_removed = HashSet::new();
+    let removed_tags: Vec<&str> = old_tags
+        .iter()
+        .map(String::as_str)
+        .filter(|&item| !new_tags_set.contains(item) && seen_removed.insert(item))
+        .collect();
+
+    let insert_new_tag = tx
+        .prepare(
+            "
+        INSERT INTO tags (note, content, reviewed, creator_ip, action, commit)
+        SELECT $1::bigint, $2::text, $3::bool, $4::varchar, true, $5::int
+        WHERE NOT EXISTS (
+            SELECT 1 FROM tags
+            WHERE note = $1::bigint AND content = $2::text AND reviewed = $3::bool AND action = true
+        )
+    ",
+        )
+        .await?;
 
     let remove_new_tag = tx
         .prepare(
             "
-        DELETE FROM tags WHERE note = $1 and content = $2
+        DELETE FROM tags WHERE note = $1 and content = $2 and reviewed = $3
     ",
         )
         .await?;
@@ -321,19 +342,19 @@ async fn force_overwrite_tag(
         {
             continue; // Invalid Optional tag!
         }
-        let con = cleanser::clean(tag);
         tx.execute(
             &insert_new_tag,
-            &[&note_id, &con, &reviewed, &req_ip, &commit],
+            &[&note_id, &tag, &reviewed, &req_ip, &commit],
         )
         .await?;
-        added_tags.push(con);
+        added_tags.push(tag.to_string());
     }
 
     let mut removed_tags_clean: Vec<String> = Vec::new();
     for tag in removed_tags {
-        let con = cleanser::clean(&tag);
-        tx.execute(&remove_new_tag, &[&note_id, &con]).await?;
+        let con = cleanser::clean(tag);
+        tx.execute(&remove_new_tag, &[&note_id, &con, &reviewed])
+            .await?;
         removed_tags_clean.push(con);
     }
 
@@ -385,23 +406,53 @@ async fn check_tag(
         .map(|row| row.get::<_, String>("content"))
         .collect::<Vec<String>>();
 
-    // HashSet could be faster in theory, but since our vecs are expected to be very small (< 100 tags on average) this is probably more performant
-    let new_tags: Vec<_> = new_content
+    let new_content: Vec<String> = new_content
         .iter()
-        .filter(|item| !old_tags.contains(item))
-        .collect();
-    let removed_tags: Vec<_> = old_tags
-        .into_iter()
-        .filter(|item| !new_content.contains(item))
+        .map(|item| cleanser::clean(item))
+        .filter(|item| !item.is_empty())
         .collect();
 
-    let insert_new_tag = tx.prepare("
-        INSERT INTO tags (note, content, reviewed, creator_ip, action, commit) VALUES ($1, $2, false, $3, true, $4)
-    ").await?;
+    let old_tags_set: HashSet<&str> = old_tags.iter().map(String::as_str).collect();
+    let new_tags_set: HashSet<&str> = new_content.iter().map(String::as_str).collect();
 
-    let remove_new_tag = tx.prepare("
-        INSERT INTO tags (note, content, reviewed, creator_ip, action, commit) VALUES ($1, $2, false, $3, false, $4)
-    ").await?;
+    let mut seen_new = HashSet::new();
+    let new_tags: Vec<&str> = new_content
+        .iter()
+        .map(String::as_str)
+        .filter(|&item| !old_tags_set.contains(item) && seen_new.insert(item))
+        .collect();
+    let mut seen_removed = HashSet::new();
+    let removed_tags: Vec<&str> = old_tags
+        .iter()
+        .map(String::as_str)
+        .filter(|&item| !new_tags_set.contains(item) && seen_removed.insert(item))
+        .collect();
+
+    let insert_new_tag = tx
+        .prepare(
+            "
+        INSERT INTO tags (note, content, reviewed, creator_ip, action, commit)
+        SELECT $1::bigint, $2::text, false, $3::varchar, true, $4::int
+        WHERE NOT EXISTS (
+            SELECT 1 FROM tags
+            WHERE note = $1::bigint AND content = $2::text AND reviewed = false AND action = true
+        )
+    ",
+        )
+        .await?;
+
+    let remove_new_tag = tx
+        .prepare(
+            "
+        INSERT INTO tags (note, content, reviewed, creator_ip, action, commit)
+        SELECT $1::bigint, $2::text, false, $3::varchar, false, $4::int
+        WHERE NOT EXISTS (
+            SELECT 1 FROM tags
+            WHERE note = $1::bigint AND content = $2::text AND reviewed = false AND action = false
+        )
+    ",
+        )
+        .await?;
 
     let deck_id = get_topmost_deck_by_note_id(&tx, note_id).await?;
 
@@ -411,13 +462,12 @@ async fn check_tag(
         {
             continue; // Invalid Optional tag!
         }
-        let con = cleanser::clean(tag);
-        tx.execute(&insert_new_tag, &[&note_id, &con, &req_ip, &commit])
+        tx.execute(&insert_new_tag, &[&note_id, &tag, &req_ip, &commit])
             .await?;
     }
 
     for tag in removed_tags {
-        let con = cleanser::clean(&tag);
+        let con = cleanser::clean(tag);
         tx.execute(&remove_new_tag, &[&note_id, &con, &req_ip, &commit])
             .await?;
     }

@@ -55,6 +55,7 @@ use rate_limiter::RateLimiter;
 use s3_throttle::S3Throttle;
 use tokio::signal;
 use tokio::sync::RwLock;
+use tokio_util::task::TaskTracker;
 
 use tower_http::{classify::ServerErrorsFailureClass, trace::TraceLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -133,11 +134,11 @@ fn validate_deck_hash(deck_hash: &str) -> bool {
 
     // Validate deck hash format: 3, 5, or 6 words (legacy and standard formats)
     if parts.len() != 3 && parts.len() != 5 && parts.len() != 6 {
-        eprintln!(
-            "Invalid deck hash format (expected 3, 5, or 6 words, got {}): {}",
-            parts.len(),
-            deck_hash
-        );
+        // eprintln!(
+        //     "Invalid deck hash format (expected 3, 5, or 6 words, got {}): {}",
+        //     parts.len(),
+        //     deck_hash
+        // );
         return false;
     }
 
@@ -146,7 +147,7 @@ fn validate_deck_hash(deck_hash: &str) -> bool {
         .iter()
         .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_alphabetic()))
     {
-        eprintln!("Invalid deck hash format (invalid characters): {deck_hash}");
+        // eprintln!("Invalid deck hash format (invalid characters): {deck_hash}");
         return false;
     }
 
@@ -600,7 +601,7 @@ pub async fn upload_deck_stats(
     let db_state_clone = Arc::clone(&state);
     let deck_hash_for_error = info.deck_hash.clone();
 
-    tokio::spawn(async move {
+    state.tasks.spawn(async move {
         match stats::new(&db_state_clone, info, user_hash).await {
             Ok(()) => {}
             Err(err) => {
@@ -652,7 +653,7 @@ pub async fn delete_deck_stats(
             // The job row is committed at this point. Nudging the worker is only an
             // optimisation; the periodic tick would find the row regardless.
             let worker_state = Arc::clone(&state);
-            tokio::spawn(async move {
+            state.tasks.spawn(async move {
                 erasure::process_pending_jobs(&worker_state).await;
             });
             (
@@ -673,8 +674,8 @@ pub async fn confirm_media_bulk_async(
     Json(req): Json<structs::MediaBulkConfirmRequest>,
 ) -> impl IntoResponse {
     // we handle the confirmation in a seperate thread, so the user doesn't have to wait for it to finish, lacking information on which files failed to upload, trading off speed for user experience
-    let state_copy = state;
-    tokio::spawn(async move {
+    let state_copy = state.clone();
+    state.tasks.spawn(async move {
         match media_manager::confirm_media_bulk_upload(state_copy, req).await {
             Ok(_) => {}
             Err(err) => {
@@ -851,10 +852,11 @@ pub async fn check_for_update(
         // must not delay a pull that has already done its work. Not skipped when the pull returned
         // nothing, though — "active" means still syncing, and an up-to-date subscriber is exactly
         // who this counts.
-        let state = Arc::clone(&state);
-        tokio::spawn(async move {
+        let state_clone = Arc::clone(&state);
+        state.tasks.spawn(async move {
             if let Err(err) =
-                contribution_stats::touch_last_synced(&state, auth_user.user_id, &deck_hashes).await
+                contribution_stats::touch_last_synced(&state_clone, auth_user.user_id, &deck_hashes)
+                    .await
             {
                 tracing::warn!(error = %err, "Failed to record last_synced_at for synced decks");
             }
@@ -988,7 +990,7 @@ pub async fn post_data(
 
     // Clone state for the background task
     let state_clone = state.clone();
-    tokio::spawn(async move {
+    state.tasks.spawn(async move {
         let deck_tree: Vec<i64> = Vec::new(); // The tree is yet to be created. This is a new deck
         let mut notetype_cache = HashMap::new();
 
@@ -2060,6 +2062,7 @@ async fn main() {
         cache_token_replay_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         s3_throttle: s3_throttle.clone(),
         min_consent_version,
+        tasks: TaskTracker::new(),
     });
 
     let run_startup_s3_cleanup = false; // <-- CHANGE TO true TO ENABLE STARTUP CLEANUP
@@ -2176,7 +2179,10 @@ async fn main() {
     // start bulk operations cache cleanup task
     let bulk_cache_cleanup_state = state.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_mins(5)); // 5 minutes
+        let mut interval = tokio::time::interval_at(
+            tokio::time::Instant::now() + Duration::from_mins(5),
+            Duration::from_mins(5),
+        );
 
         loop {
             interval.tick().await;
@@ -2202,7 +2208,8 @@ async fn main() {
     // Schedule periodic cleanup of expired tokens
     let cleanup_state = state.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_hours(24)); // Daily
+        let mut interval =
+            tokio::time::interval_at(next_utc_time_instant(3, 0), Duration::from_hours(24));
         loop {
             interval.tick().await;
 
@@ -2366,7 +2373,7 @@ async fn main() {
         // standard rate limiting - applied to all routes EXCEPT media proxy
         .merge(media_proxy::routes().layer(axum::extract::DefaultBodyLimit::max(20 * 1024 * 1024)))
         .merge(cache_proxy::routes())
-        .with_state(state)
+        .with_state(state.clone())
         .layer(axum::extract::DefaultBodyLimit::max(50 * 1024 * 1024)) // 50 MB default for all routes
         //.layer(axum::extract::DefaultBodyLimit::disable())
         .layer((
@@ -2465,6 +2472,9 @@ async fn main() {
     .with_graceful_shutdown(shutdown_signal())
     .await
     .unwrap();
+
+    state.tasks.close();
+    state.tasks.wait().await;
 }
 
 async fn shutdown_signal() {
@@ -2488,5 +2498,91 @@ async fn shutdown_signal() {
     tokio::select! {
         () = ctrl_c => {},
         () = terminate => {},
+    }
+}
+
+#[must_use]
+pub(crate) fn duration_until_next_utc_hm(
+    now: chrono::DateTime<chrono::Utc>,
+    hour: u32,
+    minute: u32,
+) -> std::time::Duration {
+    let today_target = now
+        .date_naive()
+        .and_hms_opt(hour, minute, 0)
+        .expect("valid UTC hour and minute")
+        .and_utc();
+    let next_target = if today_target > now {
+        today_target
+    } else {
+        today_target + chrono::Duration::days(1)
+    };
+    (next_target - now)
+        .to_std()
+        .expect("next_target is strictly after now")
+}
+
+#[must_use]
+pub(crate) fn next_utc_time_instant(hour: u32, minute: u32) -> tokio::time::Instant {
+    tokio::time::Instant::now() + duration_until_next_utc_hm(chrono::Utc::now(), hour, minute)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{TimeZone, Utc};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    #[test]
+    fn test_duration_until_next_utc_hm_before_target() {
+        // Current time: 01:15:00 UTC, target: 03:00 UTC -> 1 hour 45 minutes (6300 seconds)
+        let now = Utc.with_ymd_and_hms(2026, 5, 10, 1, 15, 0).unwrap();
+        let duration = duration_until_next_utc_hm(now, 3, 0);
+        assert_eq!(duration, Duration::from_mins(105));
+    }
+
+    #[test]
+    fn test_duration_until_next_utc_hm_exact_match_returns_24h() {
+        // Current time: exactly 03:00:00 UTC, target: 03:00 UTC -> exactly 24 hours
+        let now = Utc.with_ymd_and_hms(2026, 5, 10, 3, 0, 0).unwrap();
+        let duration = duration_until_next_utc_hm(now, 3, 0);
+        assert_eq!(duration, Duration::from_hours(24));
+    }
+
+    #[test]
+    fn test_duration_until_next_utc_hm_after_target_with_seconds_offset() {
+        // Current time: 03:00:15 UTC, target: 03:00 UTC -> 24 hours minus 15 seconds
+        let now = Utc.with_ymd_and_hms(2026, 5, 10, 3, 0, 15).unwrap();
+        let duration = duration_until_next_utc_hm(now, 3, 0);
+        assert_eq!(duration, Duration::from_secs(24 * 3600 - 15));
+
+        // Current time: 15:30:45 UTC, target: 03:30 UTC -> next day at 03:30:00 UTC
+        // 15:30:45 to 03:30:00 next day: 11h 59m 15s = (11 * 3600) + (59 * 60) + 15 = 43155s
+        let now_after = Utc.with_ymd_and_hms(2026, 5, 10, 15, 30, 45).unwrap();
+        let duration_after = duration_until_next_utc_hm(now_after, 3, 30);
+        assert_eq!(
+            duration_after,
+            Duration::from_secs(11 * 3600 + 59 * 60 + 15)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_task_tracker_close_wait_draining() {
+        let tracker = tokio_util::task::TaskTracker::new();
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        for _ in 0..5 {
+            let counter_clone = Arc::clone(&counter);
+            tracker.spawn(async move {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                counter_clone.fetch_add(1, Ordering::SeqCst);
+            });
+        }
+
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+        tracker.close();
+        tracker.wait().await;
+        assert_eq!(counter.load(Ordering::SeqCst), 5);
     }
 }
