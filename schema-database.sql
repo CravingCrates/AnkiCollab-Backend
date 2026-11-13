@@ -1017,6 +1017,35 @@ ALTER SEQUENCE anki.notetype_id_seq OWNED BY anki.notetype.id;
 
 
 --
+-- Name: notetype_media_references; Type: TABLE; Schema: anki; Owner: postgres
+--
+
+CREATE TABLE anki.notetype_media_references (
+    id bigint NOT NULL,
+    media_id bigint NOT NULL,
+    notetype_id bigint NOT NULL,
+    file_name character varying(255) NOT NULL
+)
+WITH (autovacuum_vacuum_scale_factor='0.01');
+
+
+ALTER TABLE anki.notetype_media_references OWNER TO postgres;
+
+--
+-- Name: notetype_media_references_id_seq; Type: SEQUENCE; Schema: anki; Owner: postgres
+--
+
+ALTER TABLE anki.notetype_media_references ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTITY (
+    SEQUENCE NAME anki.notetype_media_references_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
+);
+
+
+--
 -- Name: notetype_template; Type: TABLE; Schema: anki; Owner: postgres
 --
 
@@ -1771,6 +1800,22 @@ ALTER TABLE ONLY anki.notes
 
 
 --
+-- Name: notetype_media_references notetype_media_references_notetype_id_file_name_key; Type: CONSTRAINT; Schema: anki; Owner: postgres
+--
+
+ALTER TABLE ONLY anki.notetype_media_references
+    ADD CONSTRAINT notetype_media_references_notetype_id_file_name_key UNIQUE (notetype_id, file_name);
+
+
+--
+-- Name: notetype_media_references notetype_media_references_pkey; Type: CONSTRAINT; Schema: anki; Owner: postgres
+--
+
+ALTER TABLE ONLY anki.notetype_media_references
+    ADD CONSTRAINT notetype_media_references_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: notifications notifications_pkey; Type: CONSTRAINT; Schema: anki; Owner: postgres
 --
 
@@ -2045,6 +2090,13 @@ CREATE INDEX idx_notetype_field_protected_notetype ON anki.notetype_field USING 
 
 
 --
+-- Name: idx_notetype_media_references_media_id; Type: INDEX; Schema: anki; Owner: postgres
+--
+
+CREATE INDEX idx_notetype_media_references_media_id ON anki.notetype_media_references USING btree (media_id);
+
+
+--
 -- Name: idx_notifications_commit_user; Type: INDEX; Schema: anki; Owner: postgres
 --
 
@@ -2063,6 +2115,13 @@ CREATE INDEX idx_notifications_deck_created_at ON anki.notifications USING btree
 --
 
 CREATE INDEX idx_notifications_user_read ON anki.notifications USING btree (user_id, is_read, created_at DESC);
+
+
+--
+-- Name: idx_tags_note_content_reviewed; Type: INDEX; Schema: anki; Owner: postgres
+--
+
+CREATE UNIQUE INDEX idx_tags_note_content_reviewed ON anki.tags USING btree (note, content) WHERE (reviewed = true);
 
 
 --
@@ -2619,6 +2678,22 @@ ALTER TABLE ONLY anki.notes
 
 ALTER TABLE ONLY anki.notetype
     ADD CONSTRAINT notetype_owner_fkey FOREIGN KEY (owner) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: notetype_media_references notetype_media_references_media_id_fkey; Type: FK CONSTRAINT; Schema: anki; Owner: postgres
+--
+
+ALTER TABLE ONLY anki.notetype_media_references
+    ADD CONSTRAINT notetype_media_references_media_id_fkey FOREIGN KEY (media_id) REFERENCES anki.media_files(id) ON DELETE CASCADE;
+
+
+--
+-- Name: notetype_media_references notetype_media_references_notetype_id_fkey; Type: FK CONSTRAINT; Schema: anki; Owner: postgres
+--
+
+ALTER TABLE ONLY anki.notetype_media_references
+    ADD CONSTRAINT notetype_media_references_notetype_id_fkey FOREIGN KEY (notetype_id) REFERENCES anki.notetype(id) ON DELETE CASCADE;
 
 
 --
