@@ -560,8 +560,7 @@ fn summarize_event_text(
             let content = json
                 .get("content")
                 .and_then(|v| v.as_str())
-                .map(cleanser::clean)
-                .unwrap_or_default();
+                .map_or_default(cleanser::clean);
             let action = json
                 .get("action")
                 .and_then(serde_json::Value::as_bool)
@@ -594,7 +593,7 @@ fn parse_denied_note(json: &JsonValue) -> CommitDeniedNote {
     let fields = json
         .get("fields")
         .and_then(serde_json::Value::as_array)
-        .map(|arr| {
+        .map_or_default(|arr| {
             arr.iter()
                 .map(|f| CommitDeniedNoteField {
                     position: f
@@ -614,17 +613,15 @@ fn parse_denied_note(json: &JsonValue) -> CommitDeniedNote {
                         .to_string(),
                 })
                 .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+        });
     let tags = json
         .get("tags")
         .and_then(serde_json::Value::as_array)
-        .map(|arr| {
+        .map_or_default(|arr| {
             arr.iter()
                 .filter_map(|t| t.as_str().map(std::string::ToString::to_string))
                 .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+        });
     CommitDeniedNote {
         note_id,
         notetype,
